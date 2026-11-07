@@ -11,7 +11,7 @@
 > | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
 > | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
 > | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
-> | Long voice clone (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~5.8s / ~3.7s |
+> | 43-char Japanese input, total time (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~5.8s / ~3.7s |
 > | Generated audio | - | Bit-identical |
 >
 > Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
@@ -1430,7 +1430,16 @@ On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and t
 
 ### Measurements
 
-1.7B, BF16. Both GPUs were measured with the same inputs and seeds.
+1.7B, BF16, `language="Japanese"`, `max_new_tokens=192`, with the default reference voice. Both GPUs were measured with the same inputs and seeds.
+
+The two voice clone inputs are:
+
+| Label | Input text | Characters | Generated audio |
+| --- | --- | --- | --- |
+| Short | 今日は晴れている。 | 9 | 1.2-1.3s |
+| Long | 朝の電車で本を読みながら、週末の予定を考えた。駅に着いたら、まず友人に電話をかけよう。 | 43 | 7.1-8.0s |
+
+The audio length varies per seed because the model chooses where the sentence ends.
 
 #### RTX 2070 (SM75)
 
@@ -1439,16 +1448,16 @@ On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and t
 | One norm call | 71.4us | 57.0us |
 | Code predictor, mean, RMSNorm only | 89.87ms | 86.29ms |
 | Code predictor, mean, with the CUDA Graph | 89.87ms | 31.75ms |
-| Short voice clone | 2.0-2.4s | 1.2-1.3s |
-| Long voice clone, 7.2s of audio | 11.5-12.5s | 5.7-5.9s |
+| Short input, total time | 2.0-2.4s | 1.2-1.3s |
+| Long input, total time | 11.5-12.5s | 5.7-5.9s |
 | Graph capture, first eligible call | - | 3.4s |
 
 #### RTX 3090 (SM86)
 
 | Measurement | Upstream | This fork |
 | --- | --- | --- |
-| Short voice clone | 1.61-1.71s | 0.66-0.72s |
-| Long voice clone, 7.2s of audio | 9.13-10.26s | 3.47-3.89s |
+| Short input, total time | 1.61-1.71s | 0.66-0.72s |
+| Long input, total time | 9.13-10.26s | 3.47-3.89s |
 | Graph capture, first eligible call | - | 2.84s |
 
 The speedup is larger on the RTX 3090 because the GPU finishes each step sooner, so removing the CPU launch cost matters more. The RTX 3090 numbers were taken with the other GPU workload on the node scaled down. Other GPUs may differ.
