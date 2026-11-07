@@ -90,47 +90,101 @@ if triton is not None:
         tl.store(yp + row * N + col, result, mask=col < N)
 
 
-def is_supported(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Return whether the input and weight can be computed by the Triton kernel."""
+def weight_is_supported(weight: torch.Tensor) -> bool:
+    """Return whether the weight can be used by the Triton kernel.
+
+    The weight dtype, shape, stride and device do not change after the model is
+    loaded, so call this once per module instead of on every forward. The input is
+    assumed to share the weight device and dtype; `input_is_supported` checks it.
+    """
     if triton is None:
         return False
-    if not hidden_states.is_cuda or weight.device != hidden_states.device:
+    if not weight.is_cuda or weight.dtype != torch.bfloat16:
         return False
-    if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+    if weight.ndim != 1 or weight.shape[0] not in SUPPORTED_WIDTHS:
         return False
-    if hidden_states.ndim < 1 or hidden_states.shape[-1] not in SUPPORTED_WIDTHS:
+    if weight.stride(0) != 1:
+        return False
+    return True
+
+
+def input_is_supported(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the input can be computed by the Triton kernel.
+
+    The weight conditions are assumed to be checked by `weight_is_supported`. Only
+    the parts that can change per call are checked: device, dtype, last dimension
+    and stride.
+    """
+    if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
+        return False
+    if hidden_states.ndim < 1 or hidden_states.shape[-1] != weight.shape[0]:
         return False
     if hidden_states.stride(-1) != 1:
         return False
-    if weight.shape != (hidden_states.shape[-1],) or weight.stride(0) != 1:
-        return False
     return True
+
+
+def is_supported(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Return whether the input and weight can be computed by the Triton kernel.
+
+    Checks both sides. For a per-call check use `input_is_supported` instead.
+    """
+    return weight_is_supported(weight) and input_is_supported(hidden_states, weight)
+
+
+# Keep one compiled launcher per (shape, stride). The code predictor calls the norm
+# 315 times per frame, so rebuilding the launch arguments from the shape and stride
+# on every call would eat up the savings from the kernel itself.
+_launchers: dict[tuple, tuple] = {}
+
+
+def _launcher_for(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float):
+    """Return the launcher for this shape and stride, compiling it on first use."""
+    key = (hidden_states.shape, hidden_states.stride(), float(eps))
+    state = _launchers.get(key)
+    if state is None:
+        width = hidden_states.shape[-1]
+        rows = math.prod(hidden_states.shape[:-1])
+        const = (
+            width,
+            float(eps),
+            tuple(hidden_states.shape[:-1]),
+            tuple(hidden_states.stride()[:-1]),
+            triton.next_power_of_2(width),
+        )
+        output = torch.empty(hidden_states.shape, device=hidden_states.device, dtype=hidden_states.dtype)
+        variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
+        kernel = _rms_norm[(rows,)](
+            hidden_states,
+            weight,
+            variance,
+            output,
+            N=const[0],
+            EPS=const[1],
+            ROW_SHAPE=const[2],
+            ROW_STRIDES=const[3],
+            BLOCK=const[4],
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        state = (kernel[(rows, 1, 1)], const)
+        _launchers[key] = state
+    return state
 
 
 def fused_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Compute a BF16 RMSNorm with the Triton kernel.
 
-    Accepts only inputs where `is_supported` is true, and returns the same values as
-    `Qwen3TTSRMSNorm.forward`. The result has the same shape and dtype as the input.
+    Accepts only inputs where `weight_is_supported` and `input_is_supported` are
+    both true, and returns the same values as `Qwen3TTSRMSNorm.forward`. The result
+    has the same shape and dtype as the input.
     """
     rows = math.prod(hidden_states.shape[:-1])
     if rows == 0:
         return torch.empty(hidden_states.shape, device=hidden_states.device, dtype=hidden_states.dtype)
-    width = hidden_states.shape[-1]
+    runner, const = _launcher_for(hidden_states, weight, eps)
     # Keep the variance reduction in PyTorch so the summation order is unchanged
     variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
     output = torch.empty(hidden_states.shape, device=hidden_states.device, dtype=hidden_states.dtype)
-    _rms_norm[(rows,)](
-        hidden_states,
-        weight,
-        variance,
-        output,
-        N=width,
-        EPS=float(eps),
-        ROW_SHAPE=tuple(hidden_states.shape[:-1]),
-        ROW_STRIDES=tuple(hidden_states.stride()[:-1]),
-        BLOCK=triton.next_power_of_2(width),
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
+    runner(hidden_states, weight, variance, output, *const)
     return output

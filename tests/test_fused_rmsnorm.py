@@ -34,7 +34,65 @@ def reference_rms_norm(hidden_states, weight, eps):
     return weight * hidden_states.to(input_dtype)
 
 
-class IsSupportedTest(unittest.TestCase):
+class WeightIsSupportedTest(unittest.TestCase):
+    def test_rejects_cpu_weight(self):
+        """A CPU weight is rejected by the Triton kernel."""
+        # Arrange
+        weight = torch.randn(128, dtype=torch.bfloat16)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertFalse(supported)
+
+    def test_rejects_float32_weight(self):
+        """A non-BF16 weight is rejected by the Triton kernel."""
+        # Arrange
+        weight = torch.randn(128, dtype=torch.float32)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertFalse(supported)
+
+    def test_rejects_unsupported_width(self):
+        """A weight whose width is neither 128 nor 1024 is rejected."""
+        # Arrange
+        weight = torch.randn(256, dtype=torch.bfloat16)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertFalse(supported)
+
+    def test_rejects_two_dimensional_weight(self):
+        """A weight that is not one dimensional is rejected."""
+        # Arrange
+        weight = torch.randn(2, 128, dtype=torch.bfloat16)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertFalse(supported)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_accepts_bf16_cuda_weight(self):
+        """A BF16 CUDA weight with a supported width is accepted."""
+        # Arrange
+        weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertTrue(supported)
+
+
+class InputIsSupportedTest(unittest.TestCase):
     def test_rejects_cpu_input(self):
         """A CPU input is rejected by the Triton kernel."""
         # Arrange
@@ -42,7 +100,7 @@ class IsSupportedTest(unittest.TestCase):
         weight = torch.randn(128, dtype=torch.bfloat16)
 
         # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
+        supported = fused_rmsnorm.input_is_supported(hidden_states, weight)
 
         # Assert
         self.assertFalse(supported)
@@ -54,19 +112,19 @@ class IsSupportedTest(unittest.TestCase):
         weight = torch.randn(128, dtype=torch.float32)
 
         # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
+        supported = fused_rmsnorm.input_is_supported(hidden_states, weight)
 
         # Assert
         self.assertFalse(supported)
 
-    def test_rejects_unsupported_width(self):
-        """An input whose last dimension is neither 128 nor 1024 is rejected."""
+    def test_rejects_width_mismatch(self):
+        """An input whose last dimension does not match the weight width is rejected."""
         # Arrange
-        hidden_states = torch.randn(1, 2, 8, 256, dtype=torch.bfloat16)
-        weight = torch.randn(256, dtype=torch.bfloat16)
+        hidden_states = torch.randn(1, 2, 8, 128, dtype=torch.bfloat16)
+        weight = torch.randn(1024, dtype=torch.bfloat16)
 
         # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
+        supported = fused_rmsnorm.input_is_supported(hidden_states, weight)
 
         # Assert
         self.assertFalse(supported)
@@ -78,32 +136,20 @@ class IsSupportedTest(unittest.TestCase):
         weight = torch.randn(128, dtype=torch.bfloat16)
 
         # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
-
-        # Assert
-        self.assertFalse(supported)
-
-    def test_rejects_weight_shape_mismatch(self):
-        """A weight whose shape does not match the last dimension is rejected."""
-        # Arrange
-        hidden_states = torch.randn(1, 2, 8, 128, dtype=torch.bfloat16)
-        weight = torch.randn(1024, dtype=torch.bfloat16)
-
-        # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
+        supported = fused_rmsnorm.input_is_supported(hidden_states, weight)
 
         # Assert
         self.assertFalse(supported)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_accepts_bf16_cuda_input(self):
-        """A BF16 CUDA input with a supported width is accepted."""
+        """A BF16 CUDA input that matches the weight width is accepted."""
         # Arrange
         hidden_states = torch.randn(1, 2, 16, 128, device="cuda", dtype=torch.bfloat16)
         weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
 
         # Act
-        supported = fused_rmsnorm.is_supported(hidden_states, weight)
+        supported = fused_rmsnorm.input_is_supported(hidden_states, weight)
 
         # Assert
         self.assertTrue(supported)

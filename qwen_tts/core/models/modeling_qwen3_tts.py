@@ -603,10 +603,22 @@ class Qwen3TTSRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        # The weight conditions do not change after loading, so they are checked once
+        # on the first forward. `to()` can change the device or dtype, so drop the
+        # cached result there and check again.
+        self._fused_weight_supported = None
+
+    def _apply(self, fn, recurse=True):
+        self._fused_weight_supported = None
+        return super()._apply(fn, recurse=recurse)
 
     def forward(self, hidden_states):
         # On CUDA with BF16, fuse the ops after the mean into one Triton kernel
-        if fused_rmsnorm.is_supported(hidden_states, self.weight):
+        weight_supported = self._fused_weight_supported
+        if weight_supported is None:
+            weight_supported = fused_rmsnorm.weight_is_supported(self.weight)
+            self._fused_weight_supported = weight_supported
+        if weight_supported and fused_rmsnorm.input_is_supported(hidden_states, self.weight):
             return fused_rmsnorm.fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
