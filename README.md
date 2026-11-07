@@ -3,18 +3,20 @@
 > [!IMPORTANT]
 > **This is a fork of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS).**
 >
-> The only difference from upstream is a faster BF16 RMSNorm in the code predictor.
-> The package name, the public API and the generated audio are unchanged.
+> The differences from upstream are two speedups in the code predictor. The package
+> name, the public API and the generated audio are unchanged.
 >
 > | | Upstream | This fork |
 > | --- | --- | --- |
 > | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
-> | Code predictor, 1 frame (RTX 2070) | 89.87ms | 86.29ms |
+> | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
+> | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
+> | Long voice clone, 7.2s of audio (RTX 2070) | ~12.0s | ~5.8s |
 > | Generated audio | - | Bit-identical |
 >
-> The kernel is used only for BF16 CUDA inputs whose last dimension is 128 or 1024
-> and contiguous, with a matching weight. Everything else, including CPU and FP16
-> runs, takes the original path. See [Fork changes](#fork-changes) for details.
+> Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
+> shapes the code predictor uses. Everything else, including CPU and FP16 runs,
+> takes the original path. See [Fork changes](#fork-changes) for details.
 
 <br>
 
@@ -1384,31 +1386,47 @@ This fork tracks [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) `main` 
 | File | Change |
 | --- | --- |
 | `qwen_tts/core/models/fused_rmsnorm.py` | New. A Triton kernel that fuses rsqrt, the BF16 rounding and the weight multiply. |
-| `qwen_tts/core/models/modeling_qwen3_tts.py` | `Qwen3TTSRMSNorm.forward` calls the kernel when the input qualifies. |
+| `qwen_tts/core/models/graph_predictor.py` | New. Replays the code predictor's 15 decode steps from one CUDA Graph. |
+| `qwen_tts/core/models/modeling_qwen3_tts.py` | `Qwen3TTSRMSNorm.forward` calls the kernel, and the code predictor's `generate` uses the graph when it applies. |
 | `tests/test_fused_rmsnorm.py` | New. Guard tests and bit-identical checks. |
+| `tests/test_graph_predictor.py` | New. Guard tests and cache behaviour. |
 
 ### Why
 
 The code predictor calls RMSNorm 315 times per frame, and each row is only 128 or 1024 elements. Running the ops after the mean as separate PyTorch calls makes kernel launches and intermediate buffers dominate on a GPU.
 
-### When the kernel is used
+The predictor is also CPU bound. One frame enqueues about 6,300 kernels for 15 decode steps, and the GPU runs for only about 23ms of the roughly 90ms the frame takes. `torch.compile` with `reduce-overhead` does not help because the input shape changes between the prefill and the decode steps, so it recaptures the graph. Writing the 15 steps out on fixed buffers and capturing them once in a CUDA Graph removes the CPU launch cost.
 
-Both `weight_is_supported` and `input_is_supported` must be true.
+### When the fast paths are used
+
+For the RMSNorm kernel, both `weight_is_supported` and `input_is_supported` must be true.
 
 | Side | Conditions |
 | --- | --- |
 | Weight | CUDA, BF16, one dimensional, width 128 or 1024, stride 1 |
 | Input | CUDA, BF16, last dimension matches the weight width, last-dimension stride 1 |
 
-Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another width. The module also imports and falls back when Triton is unavailable.
+For the CUDA Graph, `graph_predictor.is_supported` must be true: CUDA available, sampling enabled, a BF16 prefill of two tokens with batch size 1, and the configured number of decode steps.
+
+Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another shape. The modules also import and fall back when Triton is unavailable.
 
 ### Output is unchanged
+
+For the RMSNorm kernel:
 
 - The variance reduction stays in PyTorch, so the summation order is unchanged.
 - The normalized value is rounded to BF16 once before the weight multiply, which preserves where the original implementation rounds.
 - The kernel launches with `enable_fp_fusion=False` so FMA contraction cannot change the rounding.
 
-On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and the generated audio codes and waveforms matched exactly for three short and three long Japanese inputs.
+For the CUDA Graph, `DynamicCache` and `StaticCache` differ in three ways that change the numbers, and `graph_predictor._StaticCache` reproduces the `DynamicCache` behaviour:
+
+- `DynamicCache` returns no attention mask and lets SDPA build the causal mask, so `get_mask_sizes` reports the filled length.
+- `DynamicCache` appends each new chunk, while the eager generate passes `cache_position=[1]` for every decode step. Writing by that index would overwrite the prefill slot, so the layer appends at the filled offset.
+- `DynamicCache` returns only the filled keys and values, so the layer slices the padded tail away.
+
+Sampling follows `GenerationMixin.sample`: the logits are cast to FP32, divided by the temperature, filtered by top-k, passed through softmax and drawn with `torch.multinomial`. The RNG state is consumed in the same order as the eager path.
+
+On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and the generated audio codes and waveforms matched exactly for three short and three long Japanese inputs. The CUDA Graph path produced the same codes and waveforms as the eager path for the same six inputs.
 
 ### Measurements
 
@@ -1417,18 +1435,19 @@ RTX 2070, 1.7B, BF16.
 | Measurement | Upstream | This fork |
 | --- | --- | --- |
 | One norm call | 71.4us | 57.0us |
-| Code predictor, 30 interleaved trials, median | - | 4.23% faster |
-| Code predictor, mean | 89.87ms | 86.29ms |
+| Code predictor, mean, RMSNorm only | 89.87ms | 86.29ms |
+| Code predictor, mean, with the CUDA Graph | 89.87ms | 31.75ms |
+| Long voice clone, 7.2s of audio | ~12.0s | ~5.8s |
 
-The speedup was measured on a single RTX 2070 (SM75). Other GPUs may differ.
+The CUDA Graph takes about 3.4s to capture on the first eligible call. The speedups were measured on a single RTX 2070 (SM75). Other GPUs may differ.
 
 ### Testing
 
 ```shell
-uv run --locked python -m unittest -v tests.test_fused_rmsnorm
+uv run --locked python -m unittest -v tests.test_fused_rmsnorm tests.test_graph_predictor
 ```
 
-The guard tests run without a GPU. The numerical tests are skipped when CUDA is unavailable.
+The guard tests run without a GPU. The numerical and cache tests are skipped when CUDA is unavailable.
 
 ### Keeping up with upstream
 
