@@ -1335,6 +1335,40 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         model_kwargs["generation_steps"] = outputs.generation_steps
         return model_kwargs
 
+    def generate(self, *args, **kwargs):
+        """Generate the remaining codes, using a CUDA Graph when it applies.
+
+        The decode loop is CPU bound, so a captured graph makes the frame several
+        times faster. `graph_predictor.GraphCodePredictor` reproduces the eager
+        output exactly; when the conditions do not hold, the eager path runs.
+        """
+        graph = self._graph_predictor(kwargs)
+        if graph is None:
+            return super().generate(*args, **kwargs)
+        codes = graph.replay(kwargs)
+        # The caller reads only `.sequences`
+        return Qwen3TTSTalkerCodePredictorGraphOutput(sequences=codes)
+
+    def _graph_predictor(self, kwargs):
+        """Return a captured graph predictor, building it on the first eligible call."""
+        from .graph_predictor import GraphCodePredictor, is_supported
+
+        if not is_supported(self, kwargs):
+            return None
+        cached = getattr(self, "_graph_cache", None)
+        if cached is None:
+            cached = GraphCodePredictor(self, kwargs)
+            cached.capture(kwargs)
+            self._graph_cache = cached
+        return cached
+
+
+@dataclass
+class Qwen3TTSTalkerCodePredictorGraphOutput(ModelOutput):
+    """Output of the CUDA Graph path. The caller reads only `sequences`."""
+
+    sequences: Optional[torch.LongTensor] = None
+
 
 @dataclass
 class Qwen3TTSTalkerOutputWithPast(ModelOutput):
