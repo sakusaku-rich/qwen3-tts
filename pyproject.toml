@@ -44,3 +44,6 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 qwen_tts = ["py.typed", "**/*.npz"]
+
+# fused_rmsnorm imports without Triton and falls back to the original path. Triton is
+# not listed here because torch already depends on it transitively on Linux.
