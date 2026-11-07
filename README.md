@@ -1,5 +1,21 @@
 # Qwen3-TTS
 
+> [!IMPORTANT]
+> **This is a fork of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS).**
+>
+> The only difference from upstream is a faster BF16 RMSNorm in the code predictor.
+> The package name, the public API and the generated audio are unchanged.
+>
+> | | Upstream | This fork |
+> | --- | --- | --- |
+> | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
+> | Code predictor, 1 frame (RTX 2070) | 89.87ms | 86.29ms |
+> | Generated audio | - | Bit-identical |
+>
+> The kernel is used only for BF16 CUDA inputs whose last dimension is 128 or 1024
+> and contiguous, with a matching weight. Everything else, including CPU and FP16
+> runs, takes the original path. See [Fork changes](#fork-changes) for details.
+
 <br>
 
 <p align="center">
@@ -39,6 +55,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
 - [Fine Tuning](#fine-tuning)
 - [Evaluation](#evaluation)
 - [Citation](#citation)
+- [Fork changes](#fork-changes)
 
 ## Overview
 ### Introduction
@@ -1356,6 +1373,72 @@ If you find our paper and code useful in your research, please consider giving a
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=QwenLM/Qwen3-TTS&type=Date)](https://star-history.com/#QwenLM/Qwen3-TTS&Date)
+
+
+## Fork changes
+
+This fork tracks [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) `main` and adds one change: a fused BF16 RMSNorm.
+
+### What changed
+
+| File | Change |
+| --- | --- |
+| `qwen_tts/core/models/fused_rmsnorm.py` | New. A Triton kernel that fuses rsqrt, the BF16 rounding and the weight multiply. |
+| `qwen_tts/core/models/modeling_qwen3_tts.py` | `Qwen3TTSRMSNorm.forward` calls the kernel when the input qualifies. |
+| `tests/test_fused_rmsnorm.py` | New. Guard tests and bit-identical checks. |
+
+### Why
+
+The code predictor calls RMSNorm 315 times per frame, and each row is only 128 or 1024 elements. Running the ops after the mean as separate PyTorch calls makes kernel launches and intermediate buffers dominate on a GPU.
+
+### When the kernel is used
+
+Both `weight_is_supported` and `input_is_supported` must be true.
+
+| Side | Conditions |
+| --- | --- |
+| Weight | CUDA, BF16, one dimensional, width 128 or 1024, stride 1 |
+| Input | CUDA, BF16, last dimension matches the weight width, last-dimension stride 1 |
+
+Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another width. The module also imports and falls back when Triton is unavailable.
+
+### Output is unchanged
+
+- The variance reduction stays in PyTorch, so the summation order is unchanged.
+- The normalized value is rounded to BF16 once before the weight multiply, which preserves where the original implementation rounds.
+- The kernel launches with `enable_fp_fusion=False` so FMA contraction cannot change the rounding.
+
+On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and the generated audio codes and waveforms matched exactly for three short and three long Japanese inputs.
+
+### Measurements
+
+RTX 2070, 1.7B, BF16.
+
+| Measurement | Upstream | This fork |
+| --- | --- | --- |
+| One norm call | 71.4us | 57.0us |
+| Code predictor, 30 interleaved trials, median | - | 4.23% faster |
+| Code predictor, mean | 89.87ms | 86.29ms |
+
+The speedup was measured on a single RTX 2070 (SM75). Other GPUs may differ.
+
+### Testing
+
+```shell
+uv run --locked python -m unittest -v tests.test_fused_rmsnorm
+```
+
+The guard tests run without a GPU. The numerical tests are skipped when CUDA is unavailable.
+
+### Keeping up with upstream
+
+```shell
+git remote add upstream https://github.com/QwenLM/Qwen3-TTS.git
+git fetch upstream
+git merge upstream/main
+```
+
+Upstream has not changed since 2026-03-17 (commit `022e286`), so this fork is a small diff on top of it.
 
 
 <br>
