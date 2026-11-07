@@ -11,7 +11,7 @@
 > | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
 > | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
 > | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
-> | Long voice clone, 7.2s of audio (RTX 2070) | ~12.0s | ~5.8s |
+> | Long voice clone (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~5.8s / ~3.7s |
 > | Generated audio | - | Bit-identical |
 >
 > Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
@@ -1426,20 +1426,32 @@ For the CUDA Graph, `DynamicCache` and `StaticCache` differ in three ways that c
 
 Sampling follows `GenerationMixin.sample`: the logits are cast to FP32, divided by the temperature, filtered by top-k, passed through softmax and drawn with `torch.multinomial`. The RNG state is consumed in the same order as the eager path.
 
-On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and the generated audio codes and waveforms matched exactly for three short and three long Japanese inputs. The CUDA Graph path produced the same codes and waveforms as the eager path for the same six inputs.
+On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and the generated audio codes and waveforms matched exactly for three short and three long Japanese inputs. The CUDA Graph path produced the same codes and waveforms as the eager path for the same six inputs, on both the RTX 2070 and the RTX 3090.
 
 ### Measurements
 
-RTX 2070, 1.7B, BF16.
+1.7B, BF16. Both GPUs were measured with the same inputs and seeds.
+
+#### RTX 2070 (SM75)
 
 | Measurement | Upstream | This fork |
 | --- | --- | --- |
 | One norm call | 71.4us | 57.0us |
 | Code predictor, mean, RMSNorm only | 89.87ms | 86.29ms |
 | Code predictor, mean, with the CUDA Graph | 89.87ms | 31.75ms |
-| Long voice clone, 7.2s of audio | ~12.0s | ~5.8s |
+| Short voice clone | 2.0-2.4s | 1.2-1.3s |
+| Long voice clone, 7.2s of audio | 11.5-12.5s | 5.7-5.9s |
+| Graph capture, first eligible call | - | 3.4s |
 
-The CUDA Graph takes about 3.4s to capture on the first eligible call. The speedups were measured on a single RTX 2070 (SM75). Other GPUs may differ.
+#### RTX 3090 (SM86)
+
+| Measurement | Upstream | This fork |
+| --- | --- | --- |
+| Short voice clone | 1.61-1.71s | 0.66-0.72s |
+| Long voice clone, 7.2s of audio | 9.13-10.26s | 3.47-3.89s |
+| Graph capture, first eligible call | - | 2.84s |
+
+The speedup is larger on the RTX 3090 because the GPU finishes each step sooner, so removing the CPU launch cost matters more. The RTX 3090 numbers were taken with the other GPU workload on the node scaled down. Other GPUs may differ.
 
 ### Testing
 
