@@ -3,20 +3,31 @@
 > [!IMPORTANT]
 > **This is a fork of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS).**
 >
-> The differences from upstream are two speedups in the code predictor. The package
-> name, the public API and the generated audio are unchanged.
+> The differences from upstream are speedups in the code predictor and the talker
+> decode loop. The package name, the public API and the generated audio are
+> unchanged.
 >
 > | | Upstream | This fork |
 > | --- | --- | --- |
 > | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
+> | Talker block norms (width 2048) | Separate PyTorch ops | Same fused kernel |
 > | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
-> | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
-> | 43-char Japanese input, total time (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~5.8s / ~3.7s |
+> | Talker decode forward (28 layers) | Eager, `DynamicCache` | Replayed from a CUDA Graph on a static KV cache |
+> | Graph rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
+> | Talker rope branch | Reads `cache_position[0]` (device sync per frame) | Python int, no sync |
 > | Generated audio | - | Bit-identical |
+>
+> 43-character Japanese input, total time (1.7B, BF16):
+>
+> | GPU | Upstream | This fork | Speedup |
+> | --- | ---: | ---: | ---: |
+> | RTX 2070 (8 GB) | ~12.0s | ~4.2s | 2.9x |
+> | RTX 3090 (24 GB) | ~9.5s | ~1.7s | 5.8x |
 >
 > Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
 > shapes the code predictor uses. Everything else, including CPU and FP16 runs,
-> takes the original path. See [Fork changes](#fork-changes) for details.
+> takes the original path. See [Fork changes](#fork-changes) for details and
+> [Measurements](#measurements) for the full breakdown.
 
 <br>
 
@@ -1379,23 +1390,43 @@ If you find our paper and code useful in your research, please consider giving a
 
 ## Fork changes
 
-This fork tracks [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) `main` and adds one change: a fused BF16 RMSNorm.
+This fork tracks [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) `main` and adds speedups that keep the output bit-identical.
 
 ### What changed
 
 | File | Change |
 | --- | --- |
 | `qwen_tts/core/models/fused_rmsnorm.py` | New. A Triton kernel that fuses rsqrt, the BF16 rounding and the weight multiply. |
-| `qwen_tts/core/models/graph_predictor.py` | New. Replays the code predictor's 15 decode steps from one CUDA Graph. |
-| `qwen_tts/core/models/modeling_qwen3_tts.py` | `Qwen3TTSRMSNorm.forward` calls the kernel, and the code predictor's `generate` uses the graph when it applies. |
+| `qwen_tts/core/models/graph_predictor.py` | New. Replays the code predictor's 15 decode steps from one CUDA Graph, and precomputes the fixed rotary tables and projected codec embeddings the graph reads. |
+| `qwen_tts/core/models/graph_talker.py` | New. Replays the talker's 28-layer decode forward from a CUDA Graph on a static KV cache. |
+| `qwen_tts/core/models/modeling_qwen3_tts.py` | `Qwen3TTSRMSNorm.forward` calls the kernel, the code predictor's `generate` and the talker's `generate` use a graph when it applies, the model forwards accept precomputed position embeddings, the talker forward no longer reads `cache_position[0]` on the device, and the hidden state collection only keeps what the callers read. |
 | `tests/test_fused_rmsnorm.py` | New. Guard tests and bit-identical checks. |
-| `tests/test_graph_predictor.py` | New. Guard tests and cache behaviour. |
+| `tests/test_graph_predictor.py` | New. Guard tests, cache behaviour and precompute checks. |
+| `tests/test_graph_talker.py` | New. Guard tests, static cache offsets and the warm-to-warm comparison with the eager path. |
+| `tests/test_talker_forward.py` | New. The rope position branch of the talker forward. |
+| `tests/test_tts_generate.py` | New. The hidden state handling of the outer generate. |
+| `tests/test_voice_clone_prompt.py` | New. When `create_voice_clone_prompt` runs the codec encoder. |
+| `benchmarks/bench_generation.py` | New. Measures the warm stage breakdown, the graph capture and the prompt reuse cost. |
 
 ### Why
 
-The code predictor calls RMSNorm 315 times per frame, and each row is only 128 or 1024 elements. Running the ops after the mean as separate PyTorch calls makes kernel launches and intermediate buffers dominate on a GPU.
+The code predictor calls RMSNorm 315 times per frame, and each row is only 128 or 1024 elements. Running the ops after the mean as separate PyTorch calls makes kernel launches and intermediate buffers dominate on a GPU. The 1.7B talker adds 57 more norms of width 2048 per forward, which the same kernel now covers.
 
 The predictor is also CPU bound. One frame enqueues about 6,300 kernels for 15 decode steps, and the GPU runs for only about 23ms of the roughly 90ms the frame takes. `torch.compile` with `reduce-overhead` does not help because the input shape changes between the prefill and the decode steps, so it recaptures the graph. Writing the 15 steps out on fixed buffers and capturing them once in a CUDA Graph removes the CPU launch cost.
+
+Inside the captured graph, three groups of kernels only recompute values that never change between frames, so they are now computed once and read from fixed buffers:
+
+- The rotary tables. The positions are the same on every frame, so one `rotary_emb` call per forward's position ids precomputes the cos/sin tables.
+- The projected codec embeddings. The eager decode embeds a code and projects it with `small_to_mtp_projection`; on the 1.7B model that is a 2048-to-1024 GEMM per step whose weights are re-read 14 times per frame. The projected tables cost about 56 MiB.
+- The talker decode loop also read `cache_position[0]` on the device to pick the rope branch, which synchronized the CPU with the GPU on every frame. The prefill marker `generation_step == -1`, already computed as a Python int, selects the same branch without the read.
+
+The talker's own decode forward is the largest single stage: on an RTX 3090 with the 1.7B model it is about 17ms of the 26.6ms frame, and the frames are about 68% of a long generation. `graph_talker` runs the same forward on a `StaticCache` and replays it from a CUDA Graph. The code predictor, the embedding sum, the logits processors, the sampling and the EOS check stay on the Python side, so only the 28-layer forward is captured. One 28-layer decode step drops from about 29.7ms to about 6.1ms.
+
+The decode step passes `attention_mask=None`. With a 2D padding mask, SDPA's mask builder calls `padding_mask.all()`, which synchronizes the CPU and aborts the capture. Every position of a decode step is valid, so the causal mask alone is enough and the values are unchanged. The position is a Python int inside the captured step, so each decode position has its own graph, captured lazily on first use.
+
+The decode loop also collected hidden states that nobody read. The talker model kept every layer's activations alive on every frame, the eager predictor kept six per decode step, and the high-level API discarded all of it. The talker forward now reports only the final hidden state, which is the last element of the old tuple and the only one the callers read, the predictor `generate` is called without hidden states, and `output_hidden_states=False` passed to `Qwen3TTSForConditionalGeneration.generate` is honoured: it skips the hidden states in the return value while the codec ids still travel through the per-step outputs.
+
+`create_voice_clone_prompt` also encoded the reference audio even when every item was x-vector-only, where the codes are discarded. An all-x-vector batch now skips the codec encoder and only extracts the speaker embedding. A mixed batch still encodes every reference, because filtering the batch would change the batch composition the encoder sees and therefore the codes of the ICL items.
 
 ### When the fast paths are used
 
@@ -1403,10 +1434,14 @@ For the RMSNorm kernel, both `weight_is_supported` and `input_is_supported` must
 
 | Side | Conditions |
 | --- | --- |
-| Weight | CUDA, BF16, one dimensional, width 128 or 1024, stride 1 |
+| Weight | CUDA, BF16, one dimensional, width 128, 1024 or 2048, stride 1 |
 | Input | CUDA, BF16, last dimension matches the weight width, last-dimension stride 1 |
 
-For the CUDA Graph, `graph_predictor.is_supported` must be true: CUDA available, sampling enabled, a BF16 prefill of two tokens with batch size 1, and the configured number of decode steps.
+For the CUDA Graph, `graph_predictor.is_supported` must be true: CUDA available, sampling enabled, a BF16 prefill of two tokens with batch size 1, and the configured number of decode steps. The precomputed tables are built with the captured graph and are dropped with it.
+
+For the talker graph, `graph_talker.is_supported` must be true: CUDA available, sampling enabled, batch size 1, BF16 embeddings, and no beams, streamer, assisted decoding or custom logits processors. Everything else takes the eager talker loop.
+
+The `generation_step` rope branch change applies to every device, including CPU, and selects the same branch as `cache_position[0] == 0` on every path `generate` takes.
 
 Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another shape. The modules also import and fall back when Triton is unavailable.
 
@@ -1417,6 +1452,32 @@ For the RMSNorm kernel:
 - The variance reduction stays in PyTorch, so the summation order is unchanged.
 - The normalized value is rounded to BF16 once before the weight multiply, which preserves where the original implementation rounds.
 - The kernel launches with `enable_fp_fusion=False` so FMA contraction cannot change the rounding.
+
+For the precomputed values:
+
+- Each rotary table is computed by one `rotary_emb` call with the position ids and shape of that eager forward, so the values are what the forward itself returns.
+- Each projected embedding row is computed with the same one-row GEMM shape as the eager decode call for that code, so a lookup returns what the embed-and-project path returns. With the identity projection (0.6B) the lookup is the original one.
+- The eager paths never read the precomputed tables: the predictor model forward computes the rotary tables itself unless they are passed in, which only the graph does.
+
+For the hidden state collection:
+
+- The talker forward reports `(final_hidden_state,)` instead of every layer's activations. The final hidden state is the last element of the old tuple, which is the only element `Qwen3TTSForConditionalGeneration.generate` and `finetuning/sft_12hz.py` read, so the values are unchanged.
+- The codec ids still travel on the same field, so the codes in the return value are unchanged.
+- Collecting hidden states is passive, so turning it off cannot change the computation. The codes and hidden states are bit-identical before and after the change.
+
+For the talker graph:
+
+- `_GraphStaticLayer` writes at the offset the caller sets and returns only the filled part, so the attention sees the same keys and values as `DynamicCache`.
+- The prefill runs eagerly with the same `DynamicCache` path, and its keys and values are copied into the static cache.
+- The logits processors and the sampling are the ones `GenerationMixin` builds for the same arguments, so the scores, the codes and the RNG consumption are the same.
+- Capturing a graph runs the step a few times, which consumes the RNG. The first call that captures therefore differs from a fully eager run with the same seed, exactly as the code predictor's graph does. Once the graphs exist, a run with a fixed seed matches the eager run bit for bit. The tests compare warm to warm for that reason.
+
+On an RTX 3090 with the 1.7B model, the generated waveform is identical with and without the talker graph (same length, same hash) once both graphs are captured.
+
+For the voice clone prompt:
+
+- x-vector-only prompts never read `ref_code`, so skipping the encoder leaves every prompt field unchanged.
+- A mixed batch keeps the encoder call exactly as before, so the ICL items keep the codes they had.
 
 For the CUDA Graph, `DynamicCache` and `StaticCache` differ in three ways that change the numbers, and `graph_predictor._StaticCache` reproduces the `DynamicCache` behaviour:
 
@@ -1441,34 +1502,80 @@ The two voice clone inputs are:
 
 The audio length varies per seed because the model chooses where the sentence ends.
 
-#### RTX 2070 (SM75)
+#### RTX 2070 and RTX 3090 side by side
 
-| Measurement | Upstream | This fork |
-| --- | --- | --- |
-| One norm call | 71.4us | 57.0us |
-| Code predictor, mean, RMSNorm only | 89.87ms | 86.29ms |
-| Code predictor, mean, with the CUDA Graph | 89.87ms | 31.75ms |
-| Short input, total time | 2.0-2.4s | 1.2-1.3s |
-| Long input, total time | 11.5-12.5s | 5.7-5.9s |
-| Graph capture, first eligible call | - | 3.4s |
+Measured with `benchmarks/bench_generation.py` on the same 1.7B model, BF16,
+SDPA, `max_new_tokens=192`, seed 1234, warm runs with the prompt reused.
+"Before" is the previous fork (PR #3), "after" is this branch.
 
-#### RTX 3090 (SM86)
+| Measurement | RTX 2070 before | RTX 2070 after | RTX 3090 before | RTX 3090 after |
+| --- | ---: | ---: | ---: | ---: |
+| Long input, total time | 5.94s | **4.15s** | 3.79s | **1.65s** |
+| Short input, total time | 1.44s | **1.03s** | 0.73s | **0.36s** |
+| Talker decode frame | 31.1ms | 13.2ms | 26.6ms | 6.1ms |
+| Predictor frame | 26.1ms | 26.2ms | 10.3ms | 10.0ms |
+| Speech decode | 345.8ms | 361.7ms | 62.0ms | 63.0ms |
+| Long input, RTF | 0.80 | 0.56 | 0.49 | 0.21 |
+| Peak VRAM | 4864 MiB | 5197 MiB | 4586 MiB | 4863 MiB |
 
-| Measurement | Upstream | This fork |
-| --- | --- | --- |
-| Short input, total time | 1.61-1.71s | 0.66-0.72s |
-| Long input, total time | 9.13-10.26s | 3.47-3.89s |
-| Graph capture, first eligible call | - | 2.84s |
+Speedup from this branch:
 
-The speedup is larger on the RTX 3090 because the GPU finishes each step sooner, so removing the CPU launch cost matters more. The RTX 3090 numbers were taken with the other GPU workload on the node scaled down. Other GPUs may differ.
+| Change | RTX 2070 (SM75) | RTX 3090 (SM86) |
+| --- | ---: | ---: |
+| Long input, total time | **1.43x** | **2.30x** |
+| Short input, total time | **1.40x** | **2.06x** |
+| Talker decode frame | 2.36x | 4.36x |
+| Predictor frame | unchanged | unchanged |
+
+The talker graph helps less on the RTX 2070 because its GPU is slower: the
+28-layer forward itself takes longer, so the CPU wait the graph removes is a
+smaller share of the frame. The predictor is unchanged on both GPUs because it
+is GPU bound already, as the [fork changes](#fork-changes) note explains.
+
+The RTX 2070 has 8 GB, so the number of captured talker graphs is bounded by the
+free VRAM (see `graph_talker.GRAPH_BYTES`). Beyond that bound the decode step
+falls back to the eager forward, which is why the 2070 keeps working instead of
+running out of memory. The talker graphs are captured lazily, one per decode
+position, so the first generation pays about 1.0s of capture cost with
+`max_new_tokens=192`.
+
+Earlier measurements from the previous PR, for reference:
+
+| Measurement | RTX 2070 upstream | RTX 2070 PR #3 | RTX 3090 upstream | RTX 3090 PR #3 |
+| --- | ---: | ---: | ---: | ---: |
+| One norm call | 71.4us | 57.0us | - | - |
+| Code predictor, RMSNorm only | 89.87ms | 86.29ms | - | - |
+| Code predictor, with the CUDA Graph | 89.87ms | 31.75ms | - | - |
+| Long input, total time | 11.5-12.5s | 5.7-5.9s | 9.13-10.26s | 3.47-3.89s |
+| Graph capture, first eligible call | - | 3.4s | - | 2.84s |
 
 ### Testing
 
 ```shell
-uv run --locked python -m unittest -v tests.test_fused_rmsnorm tests.test_graph_predictor
+uv run --locked python -m unittest -v tests.test_fused_rmsnorm tests.test_graph_predictor tests.test_graph_talker tests.test_talker_forward tests.test_tts_generate tests.test_voice_clone_prompt
 ```
 
-The guard tests run without a GPU. The numerical and cache tests are skipped when CUDA is unavailable.
+The guard tests and the precompute tests run without a GPU, on tiny models with
+random weights. The numerical, cache and graph replay tests are skipped when
+CUDA is unavailable.
+
+### Benchmarking
+
+`benchmarks/bench_generation.py` measures where a warm generation spends its
+time on the target GPU: the stage breakdown (prefill, talker frames, predictor
+frames, speech decode), the CUDA Graph capture cost, the reused prompt cost,
+the codec-level first frame offset and peak memory. `--profile` adds a
+`torch.profiler` report with the kernel launch count and the GPU busy time,
+which shows whether a stage is CPU bound.
+
+```shell
+uv run --locked python benchmarks/bench_generation.py --label long --runs 10 --profile
+```
+
+`--rebuild-prompt` builds the voice clone prompt on every run instead of
+reusing one, which measures what the reuse saves. `--x-vector-only` selects the
+mode where the codec encoder is skipped. Combining `--rebuild-prompt` with
+`--x-vector-only` measures the prompt cost after that skip.
 
 ### Keeping up with upstream
 

@@ -1070,6 +1070,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
         output_hidden_states=None,
         cache_position=None,
         generation_steps=None,
+        position_embeddings=None,
         **flash_attn_kwargs,
     ) -> BaseModelOutputWithPast:
         if input_ids is not None:
@@ -1128,8 +1129,12 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # create position embeddings to be shared across the decoder layers.
+        # The decode positions repeat every frame, so a caller that runs the
+        # same positions in a loop (e.g. graph_predictor) can pass the values
+        # it computed once with this rotary embedding.
+        if position_embeddings is None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1516,6 +1521,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1570,8 +1576,11 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # create position embeddings to be shared across the decoder layers.
+        # A caller that runs the same positions in a loop can pass the values
+        # it computed once with this rotary embedding (see graph_talker).
+        if position_embeddings is None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1726,7 +1735,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 top_p=subtalker_top_p,
                 top_k=subtalker_top_k,
                 temperature=subtalker_temperature,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict_in_generate=True,
             )
             codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
@@ -1742,9 +1751,12 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             else:
                 inputs_embeds = inputs_embeds + tts_pad_embed
         if attention_mask is not None:
+            # `generation_step == -1` marks the prefill, where `cache_position[0]`
+            # is 0. Reading that CUDA scalar would synchronize the CPU with the
+            # GPU on every decode step, so the Python int is used instead.
             if (
                 cache_position is None
-                or (cache_position is not None and cache_position[0] == 0)
+                or generation_step == -1
                 or self.rope_deltas is None
             ):
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
@@ -1769,7 +1781,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            # Only the final hidden state is ever read from this call, so the
+            # per-layer collection is skipped. It would keep every layer's
+            # activations alive on every decode frame.
+            output_hidden_states=False,
             cache_position=cache_position,
             **kwargs,
         )
@@ -1786,7 +1801,11 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=(outputs.hidden_states, codec_ids),
+            # The hidden states field also carries the codec ids through
+            # `generate`. The last element of the reported tuple is the final
+            # hidden state, which is what the callers read, so only that one
+            # is reported instead of every layer's activations.
+            hidden_states=((hidden_states,) if output_hidden_states else None, codec_ids),
             attentions=outputs.attentions,
             past_hidden=hidden_states[:, -1:, :],
             generation_step=generation_step + 1,
@@ -1859,6 +1878,116 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
         return model_kwargs
+
+    def generate(self, *args, **kwargs):
+        """Generate the talker frames, using a CUDA Graph when it applies.
+
+        The 28-layer forward of every decode frame is replayed from a captured
+        graph (see `graph_talker`). The code predictor, the embedding sum, the
+        logits processors, the sampling and the EOS check are the ones
+        `GenerationMixin` uses, so the output and the RNG consumption match the
+        eager loop. When the conditions do not hold, the eager path runs.
+        """
+        from .graph_talker import is_supported
+
+        if not is_supported(self, kwargs):
+            return super().generate(*args, **kwargs)
+        return self._generate_with_graph(kwargs)
+
+    def _generate_with_graph(self, kwargs):
+        """Run the decode loop with `graph_talker.GraphTalkerForward`."""
+        from transformers.generation.utils import GenerateDecoderOnlyOutput
+
+        from .graph_talker import GraphTalkerForward
+
+        inputs_embeds = kwargs["inputs_embeds"]
+        attention_mask = kwargs["attention_mask"]
+        trailing_text_hidden = kwargs["trailing_text_hidden"]
+        tts_pad_embed = kwargs["tts_pad_embed"]
+        max_new_tokens = kwargs["max_new_tokens"]
+        min_new_tokens = kwargs.get("min_new_tokens", 0) or 0
+
+        generation_config, _ = self._prepare_generation_config(
+            None,
+            **{name: kwargs[name] for name in (
+                "max_new_tokens", "min_new_tokens", "do_sample", "top_k", "top_p",
+                "temperature", "eos_token_id", "repetition_penalty",
+            ) if kwargs.get(name) is not None},
+        )
+        logits_processor = self._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=0,
+            device=inputs_embeds.device,
+        )
+        eos_token_id = generation_config.eos_token_id
+        do_sample = generation_config.do_sample
+
+        prefill_len = inputs_embeds.shape[1]
+        graph = getattr(self, "_graph_talker_forward", None)
+        if graph is None or graph.prefill_len != prefill_len \
+                or graph.max_cache_len < prefill_len + max_new_tokens:
+            graph = GraphTalkerForward(self, max_cache_len=prefill_len + max_new_tokens,
+                                       prefill_len=prefill_len)
+            self._graph_talker_forward = graph
+
+        # Prefill: the eager path, so its cache matches the eager loop
+        hidden = graph.prefill(inputs_embeds, attention_mask)
+        logits = self.codec_head(hidden)
+        generated = torch.zeros(1, 0, dtype=torch.long, device=inputs_embeds.device)
+        scores = logits_processor(generated, logits[:, -1, :].to(copy=True, dtype=torch.float32))
+        code = self._sample_code(scores, do_sample)
+        generated = torch.cat([generated, code], dim=-1)
+
+        # The eager forward reports `(final_hidden_tuple, codec_ids)`
+        hidden_states = [((hidden,), None)]
+        frames = [code]
+        for step in range(max_new_tokens - 1):
+            # The code predictor and the embedding sum, as in the eager forward
+            last_id_hidden = self.get_input_embeddings()(frames[-1])
+            predictor_result = self.code_predictor.generate(
+                inputs_embeds=torch.cat((hidden[:, -1:, :], last_id_hidden), dim=1),
+                max_new_tokens=self.config.num_code_groups - 1,
+                do_sample=kwargs.get("subtalker_dosample"),
+                top_p=kwargs.get("subtalker_top_p"),
+                top_k=kwargs.get("subtalker_top_k"),
+                temperature=kwargs.get("subtalker_temperature"),
+                output_hidden_states=False,
+                return_dict_in_generate=True,
+            )
+            codec_ids = torch.cat((frames[-1], predictor_result.sequences), dim=-1)
+            codec_hiddens = torch.cat(
+                [last_id_hidden]
+                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i + 1])
+                   for i in range(self.config.num_code_groups - 1)],
+                dim=1,
+            )
+            inputs = codec_hiddens.sum(1, keepdim=True)
+            if step < trailing_text_hidden.shape[1]:
+                inputs = inputs + trailing_text_hidden[:, step].unsqueeze(1)
+            else:
+                inputs = inputs + tts_pad_embed
+
+            hidden = graph.decode(inputs).clone()
+            logits = self.codec_head(hidden)
+            scores = logits_processor(generated, logits[:, -1, :].to(copy=True, dtype=torch.float32))
+            code = self._sample_code(scores, do_sample)
+            hidden_states.append(((hidden,), codec_ids))
+            frames.append(code)
+            generated = torch.cat([generated, code], dim=-1)
+            # The eager loop stops at EOS once the minimum length is reached
+            if code.item() == eos_token_id and generated.shape[-1] >= min_new_tokens:
+                break
+
+        sequences = torch.cat(frames, dim=-1)
+        return GenerateDecoderOnlyOutput(sequences=sequences,
+                                         hidden_states=tuple(hidden_states))
+
+    def _sample_code(self, scores, do_sample):
+        """Sample one code the way `GenerationMixin.sample` does."""
+        if not do_sample:
+            return torch.argmax(scores, dim=-1, keepdim=True)
+        probs = torch.nn.functional.softmax(scores, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
 
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
@@ -2092,6 +2221,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         repetition_penalty: float = 1.05,
         **kwargs,
     ):
+        want_hidden_states = kwargs.get("output_hidden_states", True)
         talker_kwargs = {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": 2,
@@ -2112,8 +2242,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 for i in range(self.config.talker_config.vocab_size - 1024, self.config.talker_config.vocab_size)
                 if i not in (self.config.talker_config.codec_eos_token_id,)
             ],
-            "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
-            "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
+            # The caller's flag controls the hidden states in the return value
+            # below. The talker's `output_hidden_states` stays on either way,
+            # because its per-step outputs are also what carries the codec ids.
+            "output_hidden_states": True,
+            "return_dict_in_generate": True
         }
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
@@ -2329,8 +2462,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         )
 
         talker_codes = torch.stack([hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None], dim=1)
-        talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
-        
+
         first_codebook = talker_codes[:, :, 0]
         is_stop_token = (first_codebook ==  self.config.talker_config.codec_eos_token_id)
         stop_indices = torch.argmax(is_stop_token.int(), dim=1)
@@ -2338,7 +2470,11 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         effective_lengths = torch.where(has_stop_token, stop_indices, talker_codes.shape[1])
         
         talker_codes_list = [talker_codes[i, :length, ] for i, length in enumerate(effective_lengths)]
-        talker_hidden_states_list = [talker_hidden_states[i, :length, :] for i, length in enumerate(effective_lengths)]
+        if want_hidden_states:
+            talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
+            talker_hidden_states_list = [talker_hidden_states[i, :length, :] for i, length in enumerate(effective_lengths)]
+        else:
+            talker_hidden_states_list = [None] * len(effective_lengths)
         
         return talker_codes_list, talker_hidden_states_list
 

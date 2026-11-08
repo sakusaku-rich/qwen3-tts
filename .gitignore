@@ -22,3 +22,7 @@ wheels/
 .vscode/
 venv/
 env/
+benchmark-results/
+# Host-specific helpers used for the RTX 3090 measurements (see benchmark-results)
+benchmarks/free_gpu.sh
+benchmarks/keep_gpu_free.sh

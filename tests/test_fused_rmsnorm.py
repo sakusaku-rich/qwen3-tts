@@ -58,7 +58,7 @@ class WeightIsSupportedTest(unittest.TestCase):
         self.assertFalse(supported)
 
     def test_rejects_unsupported_width(self):
-        """A weight whose width is neither 128 nor 1024 is rejected."""
+        """A weight whose width is not in SUPPORTED_WIDTHS is rejected."""
         # Arrange
         weight = torch.randn(256, dtype=torch.bfloat16)
 
@@ -79,11 +79,31 @@ class WeightIsSupportedTest(unittest.TestCase):
         # Assert
         self.assertFalse(supported)
 
+    def test_lists_the_talker_block_width(self):
+        """The 1.7B talker block norm width is supported."""
+        # Arrange / Act
+        widths = fused_rmsnorm.SUPPORTED_WIDTHS
+
+        # Assert
+        self.assertIn(2048, widths)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_accepts_bf16_cuda_weight(self):
         """A BF16 CUDA weight with a supported width is accepted."""
         # Arrange
         weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+
+        # Act
+        supported = fused_rmsnorm.weight_is_supported(weight)
+
+        # Assert
+        self.assertTrue(supported)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_accepts_talker_width(self):
+        """A BF16 CUDA weight of the 1.7B talker width is accepted."""
+        # Arrange
+        weight = torch.randn(2048, device="cuda", dtype=torch.bfloat16)
 
         # Act
         supported = fused_rmsnorm.weight_is_supported(weight)
@@ -158,7 +178,7 @@ class InputIsSupportedTest(unittest.TestCase):
 class FusedRMSNormTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_matches_reference_bitwise(self):
-        """The kernel matches the reference bit for bit on the shapes the code predictor uses."""
+        """The kernel matches the reference bit for bit on the shapes the models use."""
         # Arrange
         cases = [
             (1, 1, 8, 128),
@@ -167,6 +187,9 @@ class FusedRMSNormTest(unittest.TestCase):
             (1, 2, 16, 128),
             (1, 1, 1024),
             (1, 2, 1024),
+            (1, 1, 2048),
+            (1, 2, 2048),
+            (1, 16, 2048),
         ]
         eps = 1e-6
 

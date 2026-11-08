@@ -16,9 +16,9 @@
 """Compute BF16 RMSNorm with a single Triton kernel.
 
 `Qwen3TTSRMSNorm.forward` casts to FP32 and then runs the square, mean, rsqrt and
-weight multiply as separate PyTorch ops. A row is only 128 or 1024 elements, so on
-a GPU the kernel launches and the round trips through intermediate buffers dominate.
-This module fuses the ops after the mean into one kernel to cut both.
+weight multiply as separate PyTorch ops. A row is only 128, 1024 or 2048 elements,
+so on a GPU the kernel launches and the round trips through intermediate buffers
+dominate. This module fuses the ops after the mean into one kernel to cut both.
 
 Two rules keep the output bit-identical to the original:
 
@@ -45,8 +45,9 @@ except ImportError:  # without Triton, every call falls back to the original pat
     triton = None
     tl = None
 
-# Q/K norm width (head_dim) and block norm width (hidden_size) in the code predictor
-SUPPORTED_WIDTHS = (128, 1024)
+# Q/K norm width (head_dim), block norm width (hidden_size) in the code predictor,
+# and the block norm width in the 1.7B talker
+SUPPORTED_WIDTHS = (128, 1024, 2048)
 
 if triton is not None:
 
