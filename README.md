@@ -15,13 +15,19 @@
 > | Talker decode forward (28 layers) | Eager, `DynamicCache` | Replayed from a CUDA Graph on a static KV cache |
 > | Graph rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
 > | Talker rope branch | Reads `cache_position[0]` (device sync per frame) | Python int, no sync |
-> | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
-> | 43-char Japanese input, total time (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~4.2s / ~1.7s |
 > | Generated audio | - | Bit-identical |
+>
+> 43-character Japanese input, total time (1.7B, BF16):
+>
+> | GPU | Upstream | This fork | Speedup |
+> | --- | ---: | ---: | ---: |
+> | RTX 2070 (8 GB) | ~12.0s | ~4.2s | 2.9x |
+> | RTX 3090 (24 GB) | ~9.5s | ~1.7s | 5.8x |
 >
 > Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
 > shapes the code predictor uses. Everything else, including CPU and FP16 runs,
-> takes the original path. See [Fork changes](#fork-changes) for details.
+> takes the original path. See [Fork changes](#fork-changes) for details and
+> [Measurements](#measurements) for the full breakdown.
 
 <br>
 
@@ -1496,58 +1502,52 @@ The two voice clone inputs are:
 
 The audio length varies per seed because the model chooses where the sentence ends.
 
-#### RTX 2070 (SM75)
+#### RTX 2070 and RTX 3090 side by side
 
 Measured with `benchmarks/bench_generation.py` on the same 1.7B model, BF16,
 SDPA, `max_new_tokens=192`, seed 1234, warm runs with the prompt reused.
 "Before" is the previous fork (PR #3), "after" is this branch.
 
-| Measurement | Before | After | Change |
-| --- | --- | --- | --- |
-| Long input, total time | 5.94s | 4.15s | **1.43x faster** |
-| Long input, RTF | 0.80 | 0.56 | |
-| Short input, total time | 1.44s | 1.03s | **1.40x faster** |
-| Talker decode frame | 31.1ms | 13.2ms | 2.36x faster |
-| Predictor frame | 26.1ms | 26.2ms | unchanged |
-| Speech decode | 345.8ms | 361.7ms | |
-| Peak VRAM | 4864 MiB | 5197 MiB | +333 MiB |
+| Measurement | RTX 2070 before | RTX 2070 after | RTX 3090 before | RTX 3090 after |
+| --- | ---: | ---: | ---: | ---: |
+| Long input, total time | 5.94s | **4.15s** | 3.79s | **1.65s** |
+| Short input, total time | 1.44s | **1.03s** | 0.73s | **0.36s** |
+| Talker decode frame | 31.1ms | 13.2ms | 26.6ms | 6.1ms |
+| Predictor frame | 26.1ms | 26.2ms | 10.3ms | 10.0ms |
+| Speech decode | 345.8ms | 361.7ms | 62.0ms | 63.0ms |
+| Long input, RTF | 0.80 | 0.56 | 0.49 | 0.21 |
+| Peak VRAM | 4864 MiB | 5197 MiB | 4586 MiB | 4863 MiB |
 
-The talker graph helps less on the RTX 2070 than on the RTX 3090 (1.43x against
-2.30x) because the 2070's GPU is slower, so the 28-layer forward itself takes
-longer and the CPU wait the graph removes is a smaller share. The predictor is
-unchanged on both GPUs: it is GPU bound already.
+Speedup from this branch:
+
+| Change | RTX 2070 (SM75) | RTX 3090 (SM86) |
+| --- | ---: | ---: |
+| Long input, total time | **1.43x** | **2.30x** |
+| Short input, total time | **1.40x** | **2.06x** |
+| Talker decode frame | 2.36x | 4.36x |
+| Predictor frame | unchanged | unchanged |
+
+The talker graph helps less on the RTX 2070 because its GPU is slower: the
+28-layer forward itself takes longer, so the CPU wait the graph removes is a
+smaller share of the frame. The predictor is unchanged on both GPUs because it
+is GPU bound already, as the [fork changes](#fork-changes) note explains.
 
 The RTX 2070 has 8 GB, so the number of captured talker graphs is bounded by the
 free VRAM (see `graph_talker.GRAPH_BYTES`). Beyond that bound the decode step
 falls back to the eager forward, which is why the 2070 keeps working instead of
-running out of memory.
+running out of memory. The talker graphs are captured lazily, one per decode
+position, so the first generation pays about 1.0s of capture cost with
+`max_new_tokens=192`.
 
-#### RTX 3090 (SM86)
+Earlier measurements from the previous PR, for reference:
 
-| Measurement | Upstream | This fork |
-| --- | --- | --- |
-| Short input, total time | 1.61-1.71s | 0.66-0.72s |
-| Long input, total time | 9.13-10.26s | 3.47-3.89s |
-| Graph capture, first eligible call | - | 2.84s |
-
-The speedup is larger on the RTX 3090 because the GPU finishes each step sooner, so removing the CPU launch cost matters more. The RTX 3090 numbers were taken with the other GPU workload on the node scaled down. Other GPUs may differ.
-
-#### RTX 3090 with the talker graph
-
-Measured with `benchmarks/bench_generation.py` on the same 1.7B model, BF16, SDPA,
-`max_new_tokens=192`, seed 1234, warm runs with the prompt reused.
-
-| Measurement | Before the talker graph | With the talker graph | Change |
-| --- | --- | --- | --- |
-| Long input, total time | 3.79s | 1.65s | **2.30x faster** |
-| Long input, RTF | 0.49 | 0.21 | |
-| Short input, total time | 0.73s | 0.36s | **2.06x faster** |
-| One 28-layer decode step | 29.7ms | 6.1ms | 4.9x faster |
-| Peak VRAM | 4586 MiB | 4863 MiB | +277 MiB |
-
-The talker graphs are captured lazily, one per decode position, so the first
-generation pays the capture cost. With `max_new_tokens=192` that is about 1.0s
-for the first call, which the benchmark reports as the first frame cost.
+| Measurement | RTX 2070 upstream | RTX 2070 PR #3 | RTX 3090 upstream | RTX 3090 PR #3 |
+| --- | ---: | ---: | ---: | ---: |
+| One norm call | 71.4us | 57.0us | - | - |
+| Code predictor, RMSNorm only | 89.87ms | 86.29ms | - | - |
+| Code predictor, with the CUDA Graph | 89.87ms | 31.75ms | - | - |
+| Long input, total time | 11.5-12.5s | 5.7-5.9s | 9.13-10.26s | 3.47-3.89s |
+| Graph capture, first eligible call | - | 3.4s | - | 2.84s |
 
 ### Testing
 
