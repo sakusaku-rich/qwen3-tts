@@ -16,7 +16,7 @@
 > | Graph rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
 > | Talker rope branch | Reads `cache_position[0]` (device sync per frame) | Python int, no sync |
 > | Code predictor, 1 frame (RTX 2070) | 89.87ms | 31.75ms |
-> | 43-char Japanese input, total time (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~5.8s / ~1.7s |
+> | 43-char Japanese input, total time (RTX 2070 / RTX 3090) | ~12.0s / ~9.5s | ~4.2s / ~1.7s |
 > | Generated audio | - | Bit-identical |
 >
 > Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
@@ -1498,14 +1498,29 @@ The audio length varies per seed because the model chooses where the sentence en
 
 #### RTX 2070 (SM75)
 
-| Measurement | Upstream | This fork |
-| --- | --- | --- |
-| One norm call | 71.4us | 57.0us |
-| Code predictor, mean, RMSNorm only | 89.87ms | 86.29ms |
-| Code predictor, mean, with the CUDA Graph | 89.87ms | 31.75ms |
-| Short input, total time | 2.0-2.4s | 1.2-1.3s |
-| Long input, total time | 11.5-12.5s | 5.7-5.9s |
-| Graph capture, first eligible call | - | 3.4s |
+Measured with `benchmarks/bench_generation.py` on the same 1.7B model, BF16,
+SDPA, `max_new_tokens=192`, seed 1234, warm runs with the prompt reused.
+"Before" is the previous fork (PR #3), "after" is this branch.
+
+| Measurement | Before | After | Change |
+| --- | --- | --- | --- |
+| Long input, total time | 5.94s | 4.15s | **1.43x faster** |
+| Long input, RTF | 0.80 | 0.56 | |
+| Short input, total time | 1.44s | 1.03s | **1.40x faster** |
+| Talker decode frame | 31.1ms | 13.2ms | 2.36x faster |
+| Predictor frame | 26.1ms | 26.2ms | unchanged |
+| Speech decode | 345.8ms | 361.7ms | |
+| Peak VRAM | 4864 MiB | 5197 MiB | +333 MiB |
+
+The talker graph helps less on the RTX 2070 than on the RTX 3090 (1.43x against
+2.30x) because the 2070's GPU is slower, so the 28-layer forward itself takes
+longer and the CPU wait the graph removes is a smaller share. The predictor is
+unchanged on both GPUs: it is GPU bound already.
+
+The RTX 2070 has 8 GB, so the number of captured talker graphs is bounded by the
+free VRAM (see `graph_talker.GRAPH_BYTES`). Beyond that bound the decode step
+falls back to the eager forward, which is why the 2070 keeps working instead of
+running out of memory.
 
 #### RTX 3090 (SM86)
 
