@@ -24,6 +24,16 @@ This module writes the 15 steps out explicitly on fixed buffers and captures the
 once in a CUDA Graph. A replay then runs the whole frame from the GPU side, so the
 CPU launch cost mostly disappears.
 
+Values that never change between frames are computed once instead of inside the
+graph, which removes their kernels from every replay:
+
+- The rotary tables. The positions are fixed, so the cos/sin tables are
+  precomputed with one `rotary_emb` call per forward's position ids. Each call
+  uses the shape of that eager forward, so the values are bit-identical.
+- The projected codec embeddings. The eager decode embeds a code and projects it
+  with `small_to_mtp_projection`. Every table row is projected once with that
+  same one-row shape, so a lookup returns bit-identical values.
+
 The output must stay bit-identical to `Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.generate`.
 `DynamicCache` and `StaticCache` differ in three ways that change the numbers, and
 `_StaticCache` below reproduces the `DynamicCache` behaviour:
@@ -159,10 +169,55 @@ class GraphCodePredictor:
             torch.tensor([[PREFILL_TOKENS + step]], device=self.device)
             for step in range(self.num_steps)
         ]
+        # The positions repeat every frame, so the rotary tables are computed once
+        # here and read by the graph instead of being rebuilt on every forward.
+        self.prefill_position_embeddings = None
+        self.step_position_embeddings = None
+        self._precompute_position_embeddings()
+        # The projected codec embeddings are fixed as well. `None` means the
+        # projection is the identity, where the lookup needs no precomputation.
+        self.projected_embeddings = self._precompute_projected_embeddings()
         self.graph: torch.cuda.CUDAGraph | None = None
+
+    def _precompute_position_embeddings(self) -> None:
+        """Compute the cos/sin tables for the fixed prefill and decode positions.
+
+        Each call passes the position ids of one eager forward, so the shapes and
+        values match what `rotary_emb` returns on that forward.
+        """
+        rotary = self.predictor.model.rotary_emb
+        # `Qwen3TTSRotaryEmbedding.forward` reads only the device and dtype of `x`
+        hidden = torch.empty(1, device=self.device, dtype=torch.bfloat16)
+        self.prefill_position_embeddings = rotary(hidden, self.prefill_position_ids)
+        self.step_position_embeddings = [
+            rotary(hidden, position_ids)
+            for position_ids in self.step_position_ids[: self.num_steps - 1]
+        ]
+
+    def _precompute_projected_embeddings(self) -> list[torch.Tensor] | None:
+        """Project the codec embedding tables once for the decode steps.
+
+        The eager decode embeds a code and projects it with
+        `small_to_mtp_projection`. Every row is projected here with that same
+        one-row shape, so the graph lookup returns bit-identical values while
+        skipping the projection GEMM on every step.
+        """
+        projection = self.predictor.small_to_mtp_projection
+        if isinstance(projection, torch.nn.Identity):
+            return None
+        embeddings = self.predictor.model.get_input_embeddings()
+        tables = []
+        with torch.no_grad():
+            for step in range(1, self.num_steps):
+                table = embeddings[step - 1].weight
+                rows = [projection(row.view(1, 1, -1)).view(-1) for row in table]
+                tables.append(torch.stack(rows))
+        return tables
 
     def _embed(self, code: torch.Tensor, step: int) -> torch.Tensor:
         """Embed one sampled code for the given decode step."""
+        if self.projected_embeddings is not None:
+            return self.projected_embeddings[step - 1][code].view(1, 1, -1)
         predictor = self.predictor
         embeds = predictor.model.get_input_embeddings()[step - 1](code.view(1, 1))
         return predictor.small_to_mtp_projection(embeds)
@@ -190,6 +245,7 @@ class GraphCodePredictor:
             cache_position=self.prefill_positions,
             position_ids=self.prefill_position_ids,
             attention_mask=None,
+            position_embeddings=self.prefill_position_embeddings,
         )
         # The eager forward applies lm_head to the whole prefill tensor
         logits = predictor.lm_head[0](outputs.last_hidden_state)[:, -1:]
@@ -204,6 +260,7 @@ class GraphCodePredictor:
                 cache_position=self.step_positions[step - 1],
                 position_ids=self.step_position_ids[step - 1],
                 attention_mask=None,
+                position_embeddings=self.step_position_embeddings[step - 1],
             )
             logits = predictor.lm_head[step](outputs.last_hidden_state)
             code = self._sample(logits)

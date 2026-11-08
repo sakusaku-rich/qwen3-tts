@@ -1070,6 +1070,7 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
         output_hidden_states=None,
         cache_position=None,
         generation_steps=None,
+        position_embeddings=None,
         **flash_attn_kwargs,
     ) -> BaseModelOutputWithPast:
         if input_ids is not None:
@@ -1128,8 +1129,12 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # create position embeddings to be shared across the decoder layers.
+        # The decode positions repeat every frame, so a caller that runs the
+        # same positions in a loop (e.g. graph_predictor) can pass the values
+        # it computed once with this rotary embedding.
+        if position_embeddings is None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1726,7 +1731,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 top_p=subtalker_top_p,
                 top_k=subtalker_top_k,
                 temperature=subtalker_temperature,
-                output_hidden_states=True,
+                output_hidden_states=False,
                 return_dict_in_generate=True,
             )
             codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
@@ -1859,7 +1864,6 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         model_kwargs["trailing_text_hidden"] = outputs.trailing_text_hidden
         model_kwargs["tts_pad_embed"] = outputs.tts_pad_embed
         return model_kwargs
-
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
     config_class = Qwen3TTSConfig
