@@ -423,7 +423,13 @@ class Qwen3TTSModel:
             ref_wavs_for_code.append(wav)
             ref_sr_for_code.append(sr)
 
-        if len(set(ref_sr_for_code)) == 1:
+        if all(bool(xvec_only) for xvec_only in xvec_list):
+            # x-vector-only prompts discard the codec codes, so encoding the
+            # reference audio would be work without a reader. A mixed batch
+            # still encodes everything: filtering it would change the batch
+            # composition of the encoder.
+            ref_codes = [None] * len(normalized)
+        elif len(set(ref_sr_for_code)) == 1:
             enc = self.model.speech_tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
             ref_codes = enc.audio_codes
         else:
