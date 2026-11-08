@@ -61,6 +61,10 @@ import torch
 from torch import nn
 from transformers.cache_utils import StaticCache, StaticLayer
 
+# Measured on an RTX 3090 with the 1.7B talker: one captured decode step takes
+# about 17 MiB of VRAM.
+GRAPH_BYTES = 17 * 2**20
+
 
 class _GraphStaticLayer(StaticLayer):
     """A static cache layer that writes at a Python offset.
@@ -152,6 +156,21 @@ class GraphTalkerForward:
                                        device=self.device, dtype=torch.bfloat16)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.position = prefill_len
+        # Each captured graph costs about 17 MiB of VRAM. Bound how many are
+        # kept by the memory available now, so a small GPU falls back to the
+        # eager forward instead of running out of memory.
+        self.max_graphs = self._graph_budget()
+
+    @staticmethod
+    def _graph_budget() -> int:
+        """Return how many graphs fit in the VRAM that is still free.
+
+        The model is already resident when this runs, so the free memory is what
+        the graphs and the activations have to share. A quarter of it goes to
+        the graphs, which keeps the rest for the forward pass.
+        """
+        free, _ = torch.cuda.mem_get_info()
+        return max(0, int(free * 0.25 / GRAPH_BYTES))
 
     def prefill(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
         """Run the prefill eagerly and fill the static cache."""
@@ -195,11 +214,17 @@ class GraphTalkerForward:
         )
         self.last_hidden.copy_(outputs.last_hidden_state)
 
-    def _graph_for(self, position: int) -> torch.cuda.CUDAGraph:
-        """Return the graph for `position`, capturing it on first use."""
+    def _graph_for(self, position: int) -> torch.cuda.CUDAGraph | None:
+        """Return the graph for `position`, capturing it on first use.
+
+        Returns None when the graph budget is used up, and the caller then runs
+        the eager forward for that position.
+        """
         graph = self.graphs.get(position)
         if graph is not None:
             return graph
+        if len(self.graphs) >= self.max_graphs:
+            return None
         # Warm up on a side stream, as CUDA Graph capture requires
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -225,9 +250,13 @@ class GraphTalkerForward:
 
     def decode(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """Replay the decode forward for the next position."""
-        graph = self._graph_for(self.position)
         self.inputs_embeds.copy_(inputs_embeds)
+        graph = self._graph_for(self.position)
         self.cache.set_offset(self.position)
-        graph.replay()
+        if graph is None:
+            # Out of graph budget: run the same step eagerly
+            self._decode_step(self.position)
+        else:
+            graph.replay()
         self.position += 1
         return self.last_hidden
