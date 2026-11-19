@@ -23,15 +23,23 @@ travel through the per-step outputs. The tests run a tiny model on any device.
 
 import functools
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 
+from qwen_tts.core.models import graph_predictor, graph_talker
 from qwen_tts.core.models.configuration_qwen3_tts import (
     Qwen3TTSConfig,
     Qwen3TTSTalkerCodePredictorConfig,
     Qwen3TTSTalkerConfig,
 )
-from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+from qwen_tts.core.models.modeling_qwen3_tts import (
+    Qwen3TTSForConditionalGeneration,
+    Qwen3TTSPreTrainedModel,
+    Qwen3TTSTokenizer,
+)
 
 TALKER_HIDDEN = 64
 PREDICTOR_HIDDEN = 32
@@ -150,6 +158,39 @@ def record_talker_past_hidden(model):
 
 
 class TtsGenerateTest(unittest.TestCase):
+    def test_loading_with_graphs_disabled_uses_eager_generation(self):
+        """The opt-out affects both graph paths for the loaded model only."""
+        # Arrange
+        model, prompt, input_ids = make_tiny_tts()
+        default_model, _, _ = make_tiny_tts()
+        torch.manual_seed(1234)
+
+        with TemporaryDirectory() as directory:
+            config_path = Path(directory) / "generation_config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with patch.object(Qwen3TTSPreTrainedModel, "from_pretrained", return_value=model) as load, patch.object(
+                Qwen3TTSTokenizer, "from_pretrained"
+            ) as load_tokenizer, patch(
+                "qwen_tts.core.models.modeling_qwen3_tts.cached_file", return_value=config_path
+            ):
+                # Act
+                loaded = Qwen3TTSForConditionalGeneration.from_pretrained(
+                    directory, use_cuda_graphs=False, local_files_only=True
+                )
+            with patch.object(graph_talker, "is_supported", return_value=False) as talker_support, patch.object(
+                graph_predictor, "is_supported", return_value=False
+            ) as predictor_support:
+                codes, _ = loaded.generate(input_ids=input_ids, voice_clone_prompt=prompt, **generate_kwargs())
+
+        # Assert
+        self.assertNotIn("use_cuda_graphs", load.call_args.kwargs)
+        self.assertNotIn("use_cuda_graphs", load_tokenizer.call_args.kwargs)
+        self.assertGreater(codes[0].shape[0], 0)
+        self.assertTrue(default_model.talker._use_cuda_graphs)
+        self.assertTrue(default_model.talker.code_predictor._use_cuda_graphs)
+        talker_support.assert_not_called()
+        predictor_support.assert_not_called()
+
     def test_generate_returns_codes_and_hidden(self):
         """The codes and the per-frame final hidden states come back."""
         # Arrange

@@ -1441,6 +1441,8 @@ For the CUDA Graph, `graph_predictor.is_supported` must be true: CUDA available,
 
 For the talker graph, `graph_talker.is_supported` must be true: CUDA available, sampling enabled, batch size 1, BF16 embeddings, and no beams, streamer, assisted decoding or custom logits processors. Everything else takes the eager talker loop.
 
+Load with `Qwen3TTSModel.from_pretrained(..., use_cuda_graphs=False)` to run both the talker and code predictor eagerly. This option can free memory for waveform decoding at the cost of longer generation times. The default is `True`.
+
 The `generation_step` rope branch change applies to every device, including CPU, and selects the same branch as `cache_position[0] == 0` on every path `generate` takes.
 
 Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another shape. The modules also import and fall back when Triton is unavailable.

@@ -1181,6 +1181,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     config_class = Qwen3TTSTalkerCodePredictorConfig
     base_model_prefix = "talker.code_predictor"
+    _use_cuda_graphs = True
 
     def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, talker_config: Qwen3TTSTalkerConfig):
         super().__init__(config)
@@ -1358,7 +1359,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         """Return a captured graph predictor, building it on the first eligible call."""
         from .graph_predictor import GraphCodePredictor, is_supported
 
-        if not is_supported(self, kwargs):
+        if not self._use_cuda_graphs or not is_supported(self, kwargs):
             return None
         cached = getattr(self, "_graph_cache", None)
         if cached is None:
@@ -1627,6 +1628,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     config_class = Qwen3TTSTalkerConfig
     base_model_prefix = "talker"
+    _use_cuda_graphs = True
 
     def __init__(self, config: Qwen3TTSTalkerConfig):
         super().__init__(config)
@@ -1890,7 +1892,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         """
         from .graph_talker import is_supported
 
-        if not is_supported(self, kwargs):
+        if not self._use_cuda_graphs or not is_supported(self, kwargs):
             return super().generate(*args, **kwargs)
         return self._generate_with_graph(kwargs)
 
@@ -2046,6 +2048,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         revision="main",
         use_safetensors=None,
         weights_only=True,
+        use_cuda_graphs: bool = True,
         **kwargs,
     ):
         # Hotfix to enable passing the correct attn implementation which is stored in the config but not in kwargs
@@ -2068,6 +2071,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             attn_implementation=requested_attn_implementation,
             **kwargs,
         )
+        model.talker._use_cuda_graphs = use_cuda_graphs
+        model.talker.code_predictor._use_cuda_graphs = use_cuda_graphs
         if not local_files_only and not os.path.isdir(pretrained_model_name_or_path):
             download_cache_dir = kwargs.get("cache_dir", cache_dir)
             download_revision = kwargs.get("revision", revision)
