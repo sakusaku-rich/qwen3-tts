@@ -15,16 +15,17 @@
 # limitations under the License.
 """Check the talker CUDA Graph path.
 
-The guard tests run without a GPU. The numerical tests run only when CUDA is
-available and compare the graph path with the eager path after both graphs are
-captured, because capturing a graph consumes the RNG.
+CPU tests cover cache contents, growth and memory limits. CUDA tests also
+check graph identity and compare warmed graph outputs with eager generation.
 """
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
 from qwen_tts.core.models import graph_talker
+from tests.test_talker_forward import make_talker_kwargs, make_tiny_talker
 
 
 class FakeConfig:
@@ -118,43 +119,143 @@ class StaticCacheTest(unittest.TestCase):
         self.assertEqual(cache.layers[0]._offset, 5)
 
 
-class GraphTalkerGenerateTest(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_generate_matches_eager_warm_to_warm(self):
-        """After both graphs are captured, the graph path matches the eager path."""
-        # Arrange
-        from test_talker_forward import make_talker_kwargs, make_tiny_talker
+class GraphBudgetTest(unittest.TestCase):
+    def test_budget_reserves_headroom_on_small_and_large_gpus(self):
+        runner = object.__new__(graph_talker.GraphTalkerForward)
+        runner.device = torch.device("cuda:1")
+        graph_bytes = graph_talker.GRAPH_BYTES
+        cases = (
+            # (device capacity, used bytes, additional graphs within the budget)
+            (8 * 2**30, 8 * 2**30 - 12 * graph_bytes, 3),
+            (24 * 2**30, 20_000_000_000 - 4 * graph_bytes, 1),
+            (24 * 2**30, 20_000_000_000 - 4 * graph_bytes + 1, 0),
+            (24 * 2**30, 20_000_000_001, 0),
+        )
+        for total, used, expected in cases:
+            with self.subTest(total=total, used=used), patch.object(
+                torch.cuda, "mem_get_info", return_value=(total - used, total)
+            ) as memory_info:
+                self.assertEqual(runner._graph_budget(), expected)
+                memory_info.assert_called_once_with(runner.device)
 
+    def test_existing_graph_replays_after_headroom_runs_out(self):
+        total = 24 * 2**30
+        with patch.object(torch.cuda, "mem_get_info", return_value=(total, total)):
+            runner = graph_talker.GraphTalkerForward(make_tiny_talker(), 16)
+
+        captured = Mock()
+        runner.graphs[runner.position] = captured
+        with patch.object(torch.cuda, "mem_get_info", return_value=(total - 20_000_000_000, total)) as memory_info:
+            runner.decode(runner.inputs_embeds)
+            captured.replay.assert_called_once_with()
+            memory_info.assert_not_called()
+            self.assertIsNone(runner._graph_for(runner.position))
+            memory_info.assert_called_once_with(runner.device)
+
+
+class GraphTalkerGenerateTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_static_cache_reuse_and_capacity_growth(self):
+        """Exercise the real prefill and bounded eager fallback on CPU."""
+        talker = make_tiny_talker()
+        original = make_talker_kwargs(talker, "cpu")
+        shorter = make_talker_kwargs(talker, "cpu")
+        shorter["inputs_embeds"] = shorter["inputs_embeds"][:, :-1]
+        shorter["attention_mask"] = shorter["attention_mask"][:, :-1]
+        shorter["eos_token_id"] = None
+
+        torch.manual_seed(1234)
+        expected = talker.generate(**shorter)
+        with patch.object(graph_talker, "is_supported", return_value=True), patch.object(
+            graph_talker.GraphTalkerForward, "_graph_budget", return_value=0
+        ):
+            talker.generate(**original)
+            runner = talker._graph_talker_forward
+            for layer in runner.cache.layers:
+                layer.keys.fill_(float("nan"))
+                layer.values.fill_(float("nan"))
+
+            torch.manual_seed(1234)
+            actual = talker.generate(**shorter)
+            self.assertIs(talker._graph_talker_forward, runner)
+            self.assertEqual(runner.graphs, {})
+            self.assertEqual(runner.position, shorter["inputs_embeds"].size(1) + actual.sequences.size(1) - 1)
+            self.assert_generation_equal(expected, actual)
+
+            # Reserve one slot beyond capacity, and stop at EOS after two tokens.
+            larger = dict(original, max_new_tokens=runner.max_cache_len - original["inputs_embeds"].size(1) + 1)
+            eos = torch.tensor([[original["eos_token_id"]]])
+            with patch.object(talker, "_sample_code", return_value=eos):
+                talker.generate(**larger)
+            self.assertIsNot(talker._graph_talker_forward, runner)
+            self.assertGreater(talker._graph_talker_forward.max_cache_len, runner.max_cache_len)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @torch.inference_mode()
+    def test_replays_shared_positions_and_matches_eager_across_prefills(self):
+        """Alternate requests while checking graph identities and exact outputs."""
+        talker = make_tiny_talker(device="cuda")
+        longer = make_talker_kwargs(talker, "cuda")
+        shorter = make_talker_kwargs(talker, "cuda")
+        shorter["inputs_embeds"] = shorter["inputs_embeds"][:, :-1]
+        shorter["attention_mask"] = shorter["attention_mask"][:, :-1]
+        for kwargs in (longer, shorter):
+            # Reach the same number of decode positions on every run.
+            kwargs["eos_token_id"] = None
+
+        talker.generate(**longer)
+        runner = talker._graph_talker_forward
+        long_start = longer["inputs_embeds"].size(1)
+        initial = dict(runner.graphs)
+        self.assertIn(long_start, initial)
+
+        talker.generate(**shorter)
+        self.assertIs(talker._graph_talker_forward, runner)
+        self.assertEqual(set(runner.graphs), set(initial) | {long_start - 1})
+        for position, graph in initial.items():
+            self.assertIs(runner.graphs[position], graph)
+        warmed = dict(runner.graphs)
+
+        for kwargs in (longer, shorter, longer):
+            with self.subTest(prefill_len=kwargs["inputs_embeds"].size(1)):
+                with patch.object(graph_talker, "is_supported", return_value=False):
+                    torch.manual_seed(1234)
+                    expected = talker.generate(**kwargs)
+                    expected_rng = torch.cuda.get_rng_state()
+                torch.manual_seed(1234)
+                actual = talker.generate(**kwargs)
+                self.assertTrue(torch.equal(expected_rng, torch.cuda.get_rng_state()))
+                self.assert_generation_equal(expected, actual)
+                self.assertIs(talker._graph_talker_forward, runner)
+                self.assertEqual(runner.graphs, warmed)
+
+    def assert_generation_equal(self, expected, actual):
+        self.assertTrue(torch.equal(expected.sequences, actual.sequences))
+        self.assertEqual(len(expected.hidden_states), len(actual.hidden_states))
+        for i, (e, a) in enumerate(zip(expected.hidden_states, actual.hidden_states)):
+            self.assertTrue(torch.equal(e[0][-1], a[0][-1]), f"hidden mismatch at frame {i}")
+            if i:
+                self.assertTrue(torch.equal(e[1], a[1]), f"codec mismatch at frame {i}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @torch.inference_mode()
+    def test_full_cache_keeps_overlap_and_makes_room_for_new_prompt(self):
         talker = make_tiny_talker(device="cuda")
         kwargs = make_talker_kwargs(talker, "cuda")
-        original = graph_talker.is_supported
-        try:
-            # Warm both paths so neither capture happens during the comparison
-            graph_talker.is_supported = lambda *a, **k: False
-            torch.manual_seed(1)
+        kwargs["eos_token_id"] = None
+        with patch.object(graph_talker.GraphTalkerForward, "_graph_budget", return_value=2):
             talker.generate(**kwargs)
-            graph_talker.is_supported = original
-            torch.manual_seed(1)
+            runner = talker._graph_talker_forward
+            start = runner.prefill_len
+            self.assertEqual(set(runner.graphs), {start, start + 1})
+            common_graph = runner.graphs[start]
+
+            kwargs["inputs_embeds"] = kwargs["inputs_embeds"][:, :-1]
+            kwargs["attention_mask"] = kwargs["attention_mask"][:, :-1]
             talker.generate(**kwargs)
-
-            # Act
-            graph_talker.is_supported = lambda *a, **k: False
-            torch.manual_seed(1234)
-            eager = talker.generate(**kwargs)
-            eager_rng = torch.cuda.get_rng_state().clone()
-            graph_talker.is_supported = original
-            torch.manual_seed(1234)
-            graph = talker.generate(**kwargs)
-            graph_rng = torch.cuda.get_rng_state().clone()
-        finally:
-            graph_talker.is_supported = original
-
-        # Assert
-        self.assertTrue(torch.equal(eager.sequences, graph.sequences))
-        self.assertTrue(torch.equal(eager_rng, graph_rng))
-        self.assertEqual(len(eager.hidden_states), len(graph.hidden_states))
-        for i, (e, g) in enumerate(zip(eager.hidden_states, graph.hidden_states)):
-            self.assertTrue(torch.equal(e[0][-1], g[0][-1]), f"hidden mismatch at frame {i}")
+            self.assertIs(talker._graph_talker_forward, runner)
+            self.assertIs(runner.graphs[start], common_graph)
+            self.assertEqual(set(runner.graphs), {start - 1, start})
 
 
 if __name__ == "__main__":
