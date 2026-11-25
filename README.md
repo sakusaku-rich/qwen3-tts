@@ -1566,6 +1566,19 @@ Two Japanese inputs with prefill lengths of 151 and 158 were generated alternate
 
 The first two requests captured 22 and 32 graphs respectively. All six subsequent requests reused every decode position. Waveform SHA-256 matched the baseline for all eight requests. Peak process VRAM sampled with `nvidia-smi` every 100 ms increased from 6,260 to 6,348 MiB. A separate 114-character input generated 15.52 seconds of audio with 194 new graph captures and reached 8,774 MiB (9.20 GB) with a 512-token generation limit.
 
+#### Alternating prompt lengths on RTX 2070
+
+The same two inputs and generation settings were tested on the 8 GB RTX 2070. Each median covers the last three runs per input, timed until the waveform was complete.
+
+| Japanese input length | Before graph reuse (`48e63ae`) | With graph reuse | Time saved |
+| --- | ---: | ---: | ---: |
+| 13 characters | 2.39 s | 1.71 s | 28% |
+| 24 characters | 3.52 s | 2.71 s | 23% |
+
+The first run of each input took about 0.1 s longer with graph reuse. On subsequent runs the talker reused 15 positions for the shorter input and 32 for the longer one. Each request captured seven positions, and the longer input ran eight more positions eagerly. All eight waveform SHA-256 hashes matched the RTX 2070 baseline. All 60 tests passed on this GPU.
+
+Peak process VRAM sampled every 100 ms increased from 6,592 to 7,202 MiB (+610 MiB). The separate 114-character input with a 512-token generation limit ran out of memory during waveform decoding on both revisions. The decoder requested 740 MiB with 524.5 MiB free on the baseline and 522.5 MiB free with graph reuse.
+
 ### Testing
 
 ```shell
