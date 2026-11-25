@@ -1644,6 +1644,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             talker_config=config
         )
         self.rope_deltas = None
+        self._graph_talker_forward = None
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1924,12 +1925,14 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         eos_token_id = generation_config.eos_token_id
         do_sample = generation_config.do_sample
 
-        prefill_len = inputs_embeds.shape[1]
-        graph = getattr(self, "_graph_talker_forward", None)
-        if graph is None or graph.prefill_len != prefill_len \
-                or graph.max_cache_len < prefill_len + max_new_tokens:
-            graph = GraphTalkerForward(self, max_cache_len=prefill_len + max_new_tokens,
-                                       prefill_len=prefill_len)
+        required_cache_len = inputs_embeds.shape[1] + max_new_tokens
+        graph = self._graph_talker_forward
+        if graph is not None and (graph.max_cache_len < required_cache_len or graph.device != inputs_embeds.device):
+            # A larger KV allocation changes the addresses recorded by every graph.
+            # Release the old graphs before allocating their replacement.
+            self._graph_talker_forward = graph = None
+        if graph is None:
+            graph = GraphTalkerForward(self, required_cache_len)
             self._graph_talker_forward = graph
 
         # Prefill: the eager path, so its cache matches the eager loop

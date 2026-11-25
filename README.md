@@ -12,7 +12,7 @@
 > | `Qwen3TTSRMSNorm.forward` | Separate PyTorch ops | Fused into one Triton kernel |
 > | Talker block norms (width 2048) | Separate PyTorch ops | Same fused kernel |
 > | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
-> | Talker decode forward (28 layers) | Eager, `DynamicCache` | Replayed from a CUDA Graph on a static KV cache |
+> | Talker decode forward (28 layers) | Eager, `DynamicCache` | Replayed from a CUDA Graph on a static KV cache shared across sequential requests |
 > | Graph rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
 > | Talker rope branch | Reads `cache_position[0]` (device sync per frame) | Python int, no sync |
 > | Generated audio | - | Bit-identical |
@@ -1424,6 +1424,10 @@ The talker's own decode forward is the largest single stage: on an RTX 3090 with
 
 The decode step passes `attention_mask=None`. With a 2D padding mask, SDPA's mask builder calls `padding_mask.all()`, which synchronizes the CPU and aborts the capture. Every position of a decode step is valid, so the causal mask alone is enough and the values are unchanged. The position is a Python int inside the captured step, so each decode position has its own graph, captured lazily on first use.
 
+Sequential requests on the same model can reuse graphs for overlapping absolute decode positions, even when their prompt lengths differ. Each request runs a fresh prefill and overwrites the KV prefix with its own prompt. The KV capacity rounds up to a multiple of 64 positions. A request whose prompt and generation limit exceed that capacity replaces the cache and its graphs.
+
+The talker budgets up to one quarter of the GPU memory available below 20 GB (decimal) or the device capacity, whichever is smaller. As the cache fills, it prioritizes the first decode positions of the current request and reclaims slots held by other positions. It checks headroom before each new capture and runs uncaptured positions eagerly when the budget is exhausted. The budget applies to graph capture. Peak usage including model loading and waveform decoding depends on the workload.
+
 The decode loop also collected hidden states that nobody read. The talker model kept every layer's activations alive on every frame, the eager predictor kept six per decode step, and the high-level API discarded all of it. The talker forward now reports only the final hidden state, which is the last element of the old tuple and the only one the callers read, the predictor `generate` is called without hidden states, and `output_hidden_states=False` passed to `Qwen3TTSForConditionalGeneration.generate` is honoured: it skips the hidden states in the return value while the codec ids still travel through the per-step outputs.
 
 `create_voice_clone_prompt` also encoded the reference audio even when every item was x-vector-only, where the codes are discarded. An all-x-vector batch now skips the codec encoder and only extracts the speaker embedding. A mixed batch still encodes every reference, because filtering the batch would change the batch composition the encoder sees and therefore the codes of the ICL items.
@@ -1550,6 +1554,30 @@ Earlier measurements from the previous PR, for reference:
 | Code predictor, with the CUDA Graph | 89.87ms | 31.75ms | - | - |
 | Long input, total time | 11.5-12.5s | 5.7-5.9s | 9.13-10.26s | 3.47-3.89s |
 | Graph capture, first eligible call | - | 3.4s | - | 2.84s |
+
+#### Alternating prompt lengths on RTX 3090
+
+Two Japanese inputs with prefill lengths of 151 and 158 were generated alternately four times each on 1.7B-Base (BF16, SDPA, batch size 1, `non_streaming_mode=True`, seed 1234, `max_new_tokens=112`). The model and reference prompt stayed loaded. The table gives the median time from requesting the waveform to receiving it across the last three runs of each input.
+
+| Japanese input | Generated audio | Before graph reuse (`48e63ae`) | With graph reuse |
+| --- | ---: | ---: | ---: |
+| 今日の午後は晴れるそうだ。 | 1.76 seconds | 1.85 s | 0.42 s |
+| 今日の午後は晴れるそうだから、公園を散歩しよう。 | 3.76 seconds | 3.82 s | 0.82 s |
+
+The first two requests captured 22 and 32 graphs respectively. All six subsequent requests reused every decode position. Waveform SHA-256 matched the baseline for all eight requests. Peak process VRAM sampled with `nvidia-smi` every 100 ms increased from 6,260 to 6,348 MiB. A separate 114-character input generated 15.52 seconds of audio with 194 new graph captures and reached 8,774 MiB (9.20 GB) with a 512-token generation limit.
+
+#### Alternating prompt lengths on RTX 2070
+
+The same two inputs and generation settings were tested on the 8 GB RTX 2070. Each median covers the last three runs per input, timed until the waveform was complete.
+
+| Japanese input length | Before graph reuse (`48e63ae`) | With graph reuse | Time saved |
+| --- | ---: | ---: | ---: |
+| 13 characters | 2.39 s | 1.71 s | 28% |
+| 24 characters | 3.52 s | 2.71 s | 23% |
+
+The first run of each input took about 0.1 s longer with graph reuse. On subsequent runs the talker reused 15 positions for the shorter input and 32 for the longer one. Each request captured seven positions, and the longer input ran eight more positions eagerly. All eight waveform SHA-256 hashes matched the RTX 2070 baseline. All 60 tests passed on this GPU.
+
+Peak process VRAM sampled every 100 ms increased from 6,592 to 7,202 MiB (+610 MiB). The separate 114-character input with a 512-token generation limit ran out of memory during waveform decoding on both revisions. The decoder requested 740 MiB with 524.5 MiB free on the baseline and 522.5 MiB free with graph reuse.
 
 ### Testing
 

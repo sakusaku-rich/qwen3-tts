@@ -64,6 +64,8 @@ from transformers.cache_utils import StaticCache, StaticLayer
 # Measured on an RTX 3090 with the 1.7B talker: one captured decode step takes
 # about 17 MiB of VRAM.
 GRAPH_BYTES = 17 * 2**20
+VRAM_TARGET_BYTES = 20_000_000_000
+CACHE_BLOCK_SIZE = 64
 
 
 class _GraphStaticLayer(StaticLayer):
@@ -141,11 +143,13 @@ class GraphTalkerForward:
     final hidden state.
     """
 
-    def __init__(self, talker: nn.Module, max_cache_len: int, prefill_len: int):
+    def __init__(self, talker: nn.Module, required_cache_len: int):
         self.talker = talker
         self.device = next(talker.parameters()).device
+        # Nearby input lengths can share KV storage and its captured addresses.
+        max_cache_len = ((required_cache_len + CACHE_BLOCK_SIZE - 1) // CACHE_BLOCK_SIZE) * CACHE_BLOCK_SIZE
         self.max_cache_len = max_cache_len
-        self.prefill_len = prefill_len
+        self.prefill_len = 0
         self.cache = _GraphStaticCache(config=talker.config, max_cache_len=max_cache_len,
                                        device=self.device, dtype=torch.bfloat16)
         self.cache_position = torch.arange(max_cache_len, device=self.device)
@@ -155,30 +159,31 @@ class GraphTalkerForward:
         self.last_hidden = torch.zeros(1, 1, talker.config.hidden_size,
                                        device=self.device, dtype=torch.bfloat16)
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.position = prefill_len
+        self.position = 0
         # Each captured graph costs about 17 MiB of VRAM. Bound how many are
         # kept by the memory available now, so a small GPU falls back to the
         # eager forward instead of running out of memory.
         self.max_graphs = self._graph_budget()
 
-    @staticmethod
-    def _graph_budget() -> int:
+    def _graph_budget(self) -> int:
         """Return how many graphs fit in the VRAM that is still free.
 
         The model is already resident when this runs, so the free memory is what
-        the graphs and the activations have to share. A quarter of it goes to
-        the graphs, which keeps the rest for the forward pass.
+        the graphs and the activations have to share. Limit the graphs to a
+        quarter of the headroom below the device capacity or the VRAM target.
         """
-        free, _ = torch.cuda.mem_get_info()
-        return max(0, int(free * 0.25 / GRAPH_BYTES))
+        free, total = torch.cuda.mem_get_info(self.device)
+        headroom = min(total, VRAM_TARGET_BYTES) - (total - free)
+        return max(0, headroom // (4 * GRAPH_BYTES))
 
     def prefill(self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
         """Run the prefill eagerly and fill the static cache."""
-        cache_position = torch.arange(self.prefill_len, device=self.device)
+        prefill_len = inputs_embeds.shape[1]
+        cache_position = self.cache_position[:prefill_len]
         position_ids = cache_position.view(1, 1, -1).expand(3, 1, -1)
         outputs = self.talker.model(
             input_ids=None,
-            attention_mask=attention_mask[:, :self.prefill_len],
+            attention_mask=attention_mask[:, :prefill_len],
             position_ids=position_ids,
             past_key_values=None,
             inputs_embeds=inputs_embeds,
@@ -194,7 +199,9 @@ class GraphTalkerForward:
             length = keys.shape[2]
             layer.keys[:, :, :length].copy_(keys)
             layer.values[:, :, :length].copy_(values)
-        self.position = self.prefill_len
+        # Each decode graph overwrites its own slot and reads only through that
+        # slot. KV entries left past this prompt are never visible to attention.
+        self.prefill_len = self.position = prefill_len
         return outputs.last_hidden_state
 
     def _decode_step(self, position: int) -> None:
@@ -224,6 +231,15 @@ class GraphTalkerForward:
         if graph is not None:
             return graph
         if len(self.graphs) >= self.max_graphs:
+            # Keep the first budgeted steps of this request eligible even if
+            # earlier prompts filled the cache at entirely different positions.
+            prefix = range(self.prefill_len, self.prefill_len + self.max_graphs)
+            if position not in prefix:
+                return None
+            # A missing position inside this prefix guarantees one outside it.
+            obsolete = next(p for p in self.graphs if p not in prefix)
+            del self.graphs[obsolete]
+        if self._graph_budget() == 0:
             return None
         # Warm up on a side stream, as CUDA Graph capture requires
         stream = torch.cuda.Stream()
