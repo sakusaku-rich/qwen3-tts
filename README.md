@@ -1584,7 +1584,7 @@ Peak process VRAM sampled every 100 ms increased from 6,592 to 7,202 MiB (+610 M
 
 #### Shared Talker M-RoPE tables on RTX 3090
 
-This comparison used the 1.7B-Base voice clone model in BF16 with SDPA, batch size 1 and a cached reference voice prompt. Both revisions used the Japanese server settings (`non_streaming_mode=False`, `max_new_tokens=8192`) with PyTorch 2.13.0 and CUDA 13.0. The timer covered the generation call through the completed waveform.
+Time to generate a Japanese waveform with 1.7B-Base (BF16, SDPA, batch size 1) and a cached voice prompt.
 
 | Japanese input | Before sharing (`aafc130`) | With shared tables | Time saved |
 | --- | ---: | ---: | ---: |
@@ -1592,9 +1592,7 @@ This comparison used the 1.7B-Base voice clone model in BF16 with SDPA, batch si
 | 114 characters | 4.52 s | 4.30 s | 4.9% |
 | 4,096 characters | 251.89 s | 215.22 s | 14.6% |
 
-The first two rows are medians of four warm calls per input and revision, two each with seeds 1234 and 7789. The 4,096-character row is one call per revision with seed 1234. Both runs reached the generation limit and returned 8,191 codec frames (655.28 seconds of audio). Codec ID and waveform SHA-256 hashes matched the baseline on all nine timed calls.
-
-NVML sampled total device memory every 20 ms from before model load through the long request. The observed peak fell from 11.28 GB to 10.82 GB (decimal). Both long runs completed below the benchmark's 18.8 GB stop threshold.
+Shorter inputs show medians of four warm runs per revision. The 4,096-character input ran once per revision and reached the 8,192-token limit in both runs. Sampled peak GPU memory fell from **11.28 GB to 10.82 GB**. Codec IDs and waveforms matched the baseline on all nine timed calls.
 
 ### Testing
 
