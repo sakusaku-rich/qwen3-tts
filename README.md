@@ -1500,7 +1500,9 @@ On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and t
 
 ### Measurements
 
-1.7B, BF16, `language="Japanese"`, `max_new_tokens=192`, with the default reference voice. Both GPUs were measured with the same inputs and seeds.
+On an RTX 3090 with 1.7B-Base in BF16, sharing the Talker M-RoPE tables cut median generation time by 2.0% for 43 Japanese characters and 4.9% for 114 (four warm runs each). For 4,096 characters, one run per revision took 251.89 s before sharing and 215.22 s after (14.6% less time). Both reached the 8,192-token limit. Sampled peak GPU memory fell from 11.28 GB to 10.82 GB, and codec IDs and waveforms matched on all nine comparisons. [Benchmark details](https://github.com/sakusaku-rich/qwen3-tts/pull/7)
+
+The two-GPU comparison below used 1.7B, BF16, `language="Japanese"`, `max_new_tokens=192`, with the default reference voice. Both GPUs were measured with the same inputs and seeds.
 
 The two voice clone inputs are:
 
@@ -1581,18 +1583,6 @@ The same two inputs and generation settings were tested on the 8 GB RTX 2070. Ea
 The first run of each input took about 0.1 s longer with graph reuse. On subsequent runs the talker reused 15 positions for the shorter input and 32 for the longer one. Each request captured seven positions, and the longer input ran eight more positions eagerly. All eight waveform SHA-256 hashes matched the RTX 2070 baseline. All 60 tests passed on this GPU.
 
 Peak process VRAM sampled every 100 ms increased from 6,592 to 7,202 MiB (+610 MiB). The separate 114-character input with a 512-token generation limit ran out of memory during waveform decoding on both revisions. The decoder requested 740 MiB with 524.5 MiB free on the baseline and 522.5 MiB free with graph reuse.
-
-#### Shared Talker M-RoPE tables on RTX 3090
-
-Time to generate a Japanese waveform with 1.7B-Base (BF16, SDPA, batch size 1) and a cached voice prompt.
-
-| Japanese input | Before sharing (`aafc130`) | With shared tables | Time saved |
-| --- | ---: | ---: | ---: |
-| 43 characters | 1.57 s | 1.54 s | 2.0% |
-| 114 characters | 4.52 s | 4.30 s | 4.9% |
-| 4,096 characters | 251.89 s | 215.22 s | 14.6% |
-
-Shorter inputs show medians of four warm runs per revision. The 4,096-character input ran once per revision and reached the 8,192-token limit in both runs. Sampled peak GPU memory fell from **11.28 GB to 10.82 GB**. Codec IDs and waveforms matched the baseline on all nine timed calls.
 
 ### Testing
 
