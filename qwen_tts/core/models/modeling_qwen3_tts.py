@@ -706,6 +706,12 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, mrope_interle
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    cos, sin = _prepare_mrope_tables(cos, sin, mrope_section, mrope_interleaved)
+    return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+
+def _prepare_mrope_tables(cos, sin, mrope_section, mrope_interleaved):
+    """Select the temporal, height and width channels shared by all talker layers."""
     if mrope_interleaved:
 
         def apply_interleaved_rope(x, modality_num):
@@ -721,24 +727,13 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, mrope_interle
 
         dim = cos.shape[-1]
         modality_num = len(mrope_section)
-        cos = torch.cat([apply_interleaved_rope(cos[..., : dim // 2], modality_num)] * 2, dim=-1).unsqueeze(
-            unsqueeze_dim
-        )
-        sin = torch.cat([apply_interleaved_rope(sin[..., : dim // 2], modality_num)] * 2, dim=-1).unsqueeze(
-            unsqueeze_dim
-        )
+        cos = torch.cat([apply_interleaved_rope(cos[..., : dim // 2], modality_num)] * 2, dim=-1)
+        sin = torch.cat([apply_interleaved_rope(sin[..., : dim // 2], modality_num)] * 2, dim=-1)
     else:
         mrope_section = mrope_section * 2
-        cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-            unsqueeze_dim
-        )
-        sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-            unsqueeze_dim
-        )
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+        cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1)
+        sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1)
+    return cos, sin
 
 
 class Qwen3TTSTalkerAttention(nn.Module):
@@ -782,6 +777,7 @@ class Qwen3TTSTalkerAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        mrope_tables: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
@@ -792,9 +788,12 @@ class Qwen3TTSTalkerAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"], self.rope_scaling["interleaved"]
-        )
+        if mrope_tables is None:
+            # Direct attention/layer calls can still supply just the original tables.
+            mrope_tables = _prepare_mrope_tables(
+                cos, sin, self.rope_scaling["mrope_section"], self.rope_scaling["interleaved"]
+            )
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *mrope_tables)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -1582,6 +1581,10 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         # it computed once with this rotary embedding (see graph_talker).
         if position_embeddings is None:
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        rope_scaling = self.config.rope_scaling
+        mrope_tables = _prepare_mrope_tables(
+            *position_embeddings, rope_scaling["mrope_section"], rope_scaling["interleaved"]
+        )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1600,6 +1603,7 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                mrope_tables=mrope_tables,
                 **flash_attn_kwargs,
             )
 

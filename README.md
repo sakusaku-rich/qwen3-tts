@@ -13,7 +13,8 @@
 > | Talker block norms (width 2048) | Separate PyTorch ops | Same fused kernel |
 > | Code predictor decode loop | Eager, CPU bound | Replayed from a CUDA Graph |
 > | Talker decode forward (28 layers) | Eager, `DynamicCache` | Replayed from a CUDA Graph on a static KV cache shared across sequential requests |
-> | Graph rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
+> | Code predictor rotary tables and projected embeddings | Recomputed every frame | Precomputed once |
+> | Talker M-RoPE channel layout | Prepared in each attention layer | Prepared once per forward and shared across layers |
 > | Talker rope branch | Reads `cache_position[0]` (device sync per frame) | Python int, no sync |
 > | Generated audio | - | Bit-identical |
 >
@@ -24,10 +25,9 @@
 > | RTX 2070 (8 GB) | ~12.0s | ~4.2s | 2.9x |
 > | RTX 3090 (24 GB) | ~9.5s | ~1.7s | 5.8x |
 >
-> Both speedups apply only when the input qualifies: BF16 CUDA tensors with the
-> shapes the code predictor uses. Everything else, including CPU and FP16 runs,
-> takes the original path. See [Fork changes](#fork-changes) for details and
-> [Measurements](#measurements) for the full breakdown.
+> The measured speedups above use the BF16 CUDA paths. The talker also shares
+> its rotary tables on CPU and with CUDA Graphs disabled. See [Fork changes](#fork-changes)
+> for the implementation and [Measurements](#measurements) for the benchmarks.
 
 <br>
 
@@ -1404,6 +1404,7 @@ This fork tracks [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) `main` 
 | `tests/test_graph_predictor.py` | New. Guard tests, cache behaviour and precompute checks. |
 | `tests/test_graph_talker.py` | New. Guard tests, static cache offsets and the warm-to-warm comparison with the eager path. |
 | `tests/test_talker_forward.py` | New. The rope position branch of the talker forward. |
+| `tests/test_talker_mrope.py` | Checks both M-RoPE channel layouts, once-per-forward preparation and the tables passed to the KV cache. |
 | `tests/test_tts_generate.py` | New. The hidden state handling of the outer generate. |
 | `tests/test_voice_clone_prompt.py` | New. When `create_voice_clone_prompt` runs the codec encoder. |
 | `benchmarks/bench_generation.py` | New. Measures the warm stage breakdown, the graph capture and the prompt reuse cost. |
@@ -1449,7 +1450,9 @@ Load with `Qwen3TTSModel.from_pretrained(..., use_cuda_graphs=False)` to run bot
 
 The `generation_step` rope branch change applies to every device, including CPU, and selects the same branch as `cache_position[0] == 0` on every path `generate` takes.
 
-Everything else takes the original path, including CPU runs, FP16 and FP32, and inputs with another shape. The modules also import and fall back when Triton is unavailable.
+The talker prepares its multimodal rotary position embedding (M-RoPE) tables once per forward. All 28 layers of the 1.7B talker use the same channel layout for the sine and cosine values. Sharing that layout saves 27 repetitions of the same tensor copies and concatenations. This applies to both prefill and decode, on the eager and CUDA Graph paths. Each attention layer still rotates its own query and key tensors, and the KV cache receives the original sine and cosine tables.
+
+Each CUDA fast path uses its PyTorch fallback for unsupported inputs. RMSNorm also falls back when Triton is unavailable.
 
 ### Output is unchanged
 
@@ -1497,7 +1500,9 @@ On an RTX 2070, the values of 945 captured norm inputs were bit-identical, and t
 
 ### Measurements
 
-1.7B, BF16, `language="Japanese"`, `max_new_tokens=192`, with the default reference voice. Both GPUs were measured with the same inputs and seeds.
+On an RTX 3090 with 1.7B-Base in BF16, sharing the Talker M-RoPE tables cut median generation time by 2.0% for 43 Japanese characters and 4.9% for 114 (four warm runs each). For 4,096 characters, one run per revision took 251.89 s before sharing and 215.22 s after (14.6% less time). Both reached the 8,192-token limit. Sampled peak GPU memory fell from 11.28 GB to 10.82 GB, and codec IDs and waveforms matched on all nine comparisons. [Benchmark details](https://github.com/sakusaku-rich/qwen3-tts/pull/7)
+
+The two-GPU comparison below used 1.7B, BF16, `language="Japanese"`, `max_new_tokens=192`, with the default reference voice. Both GPUs were measured with the same inputs and seeds.
 
 The two voice clone inputs are:
 
@@ -1581,8 +1586,10 @@ Peak process VRAM sampled every 100 ms increased from 6,592 to 7,202 MiB (+610 M
 
 ### Testing
 
+From the repository root, run the suite in the environment where the fork is installed.
+
 ```shell
-uv run --locked python -m unittest -v tests.test_fused_rmsnorm tests.test_graph_predictor tests.test_graph_talker tests.test_talker_forward tests.test_tts_generate tests.test_voice_clone_prompt
+python -m unittest discover -s tests -v
 ```
 
 The guard tests and the precompute tests run without a GPU, on tiny models with
